@@ -1,34 +1,39 @@
 package control
 
 import (
-	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/hex"
+	"archive/tar"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
-
-	"github.com/Trickhish/sshhub/internal/version"
-	"github.com/hashicorp/yamux"
+	"time"
 )
 
-// RequestAndApplyUpdate opens an update stream with the hub, receives the new binary,
-// verifies its checksum and cryptographic Ed25519 signature, replaces the local executable,
-// and restarts the process.
-func RequestAndApplyUpdate(session *yamux.Session) error {
-	stream, err := session.OpenStream()
-	if err != nil {
-		return fmt.Errorf("open update stream: %w", err)
-	}
-	defer stream.Close()
+const githubRepo = "Trickhish/sshhub"
 
-	header, err := ReadUpdateHeader(stream)
-	if err != nil {
-		return fmt.Errorf("read update header: %w", err)
+// DownloadAndApplyGitHubUpdate downloads the latest release binary directly from GitHub
+// over verified HTTPS, atomically replaces the local executable, and restarts the service.
+func DownloadAndApplyGitHubUpdate(targetVersion string) error {
+	arch := runtime.GOARCH
+	goos := runtime.GOOS
+
+	assetName := fmt.Sprintf("sshhub-agent-%s-%s.tar.gz", goos, arch)
+	var downloadURL string
+	if targetVersion != "" && !strings.HasPrefix(targetVersion, "0.0") {
+		tag := targetVersion
+		if !strings.HasPrefix(tag, "v") {
+			tag = "v" + tag
+		}
+		downloadURL = fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", githubRepo, tag, assetName)
+	} else {
+		downloadURL = fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", githubRepo, assetName)
 	}
 
 	execPath, err := os.Executable()
@@ -43,77 +48,114 @@ func RequestAndApplyUpdate(session *yamux.Session) error {
 	dir := filepath.Dir(execPath)
 	tmpFile, err := os.CreateTemp(dir, "sshhub-agent-update-*")
 	if err != nil {
-		// Fallback to /tmp if current directory is not writable
 		tmpFile, err = os.CreateTemp("/tmp", "sshhub-agent-update-*")
 		if err != nil {
-			return fmt.Errorf("create temp binary: %w", err)
+			return fmt.Errorf("create temp file: %w", err)
 		}
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
-	hasher := sha256.New()
-	writer := io.MultiWriter(tmpFile, hasher)
+	log.Printf("agent: downloading update from GitHub (%s)...", downloadURL)
 
-	log.Printf("agent: receiving update to version %s (%d bytes)...", header.Version, header.Size)
-	n, err := io.CopyN(writer, stream, header.Size)
+	client := &http.Client{Timeout: 3 * time.Minute}
+	resp, err := client.Get(downloadURL)
 	if err != nil {
 		tmpFile.Close()
-		return fmt.Errorf("download update: %w", err)
+		return fmt.Errorf("fetch %s: %w", downloadURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		tmpFile.Close()
+		rawBinaryURL := fmt.Sprintf("https://github.com/%s/releases/latest/download/sshhub-agent-%s-%s", githubRepo, goos, arch)
+		return downloadRawBinary(rawBinaryURL, tmpPath, execPath)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		tmpFile.Close()
+		return fmt.Errorf("github returned HTTP %d for %s", resp.StatusCode, downloadURL)
+	}
+
+	gzReader, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		tmpFile.Close()
+		return downloadRawBinary(downloadURL, tmpPath, execPath)
+	}
+	defer gzReader.Close()
+
+	tarReader := tar.NewReader(gzReader)
+	found := false
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			tmpFile.Close()
+			return fmt.Errorf("read tar archive: %w", err)
+		}
+
+		if header.Typeflag == tar.TypeReg && (header.Name == "sshhub-agent" || strings.HasSuffix(header.Name, "/sshhub-agent")) {
+			if _, err := io.Copy(tmpFile, tarReader); err != nil {
+				tmpFile.Close()
+				return fmt.Errorf("extract binary from archive: %w", err)
+			}
+			found = true
+			break
+		}
 	}
 	tmpFile.Close()
 
-	if n != header.Size {
-		return fmt.Errorf("incomplete download: got %d bytes, want %d", n, header.Size)
+	if !found {
+		return fmt.Errorf("sshhub-agent binary not found in GitHub release archive")
 	}
 
-	actualSHA := hex.EncodeToString(hasher.Sum(nil))
-	if header.SHA256 != "" && actualSHA != header.SHA256 {
-		return fmt.Errorf("checksum mismatch: got %s, want %s", actualSHA, header.SHA256)
+	return installAndRestart(tmpPath, execPath)
+}
+
+func downloadRawBinary(url, tmpPath, execPath string) error {
+	client := &http.Client{Timeout: 3 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("download binary: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("github HTTP %d for %s", resp.StatusCode, url)
 	}
 
-	// Cryptographic Ed25519 signature verification against trusted Developer Public Key
-	if version.UpdatePublicKeyHex != "" {
-		if header.Signature == "" {
-			return fmt.Errorf("security error: binary update is missing required Ed25519 cryptographic signature")
-		}
-
-		trustedPubBytes, err := hex.DecodeString(version.UpdatePublicKeyHex)
-		if err != nil || len(trustedPubBytes) != ed25519.PublicKeySize {
-			return fmt.Errorf("invalid trusted public key format: %v", err)
-		}
-
-		sigBytes, err := hex.DecodeString(header.Signature)
-		if err != nil {
-			return fmt.Errorf("invalid signature encoding: %v", err)
-		}
-
-		// Verify signature over the binary SHA256 string
-		if !ed25519.Verify(trustedPubBytes, []byte(actualSHA), sigBytes) {
-			return fmt.Errorf("SECURITY ALERT: Cryptographic signature verification failed! Refusing to install untrusted update")
-		}
-		log.Printf("agent: ✓ Cryptographic Ed25519 signature verified successfully")
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(f, resp.Body)
+	f.Close()
+	if err != nil {
+		return err
 	}
 
+	return installAndRestart(tmpPath, execPath)
+}
+
+func installAndRestart(tmpPath, execPath string) error {
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
 		return fmt.Errorf("chmod binary: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, execPath); err != nil {
-		// If rename fails (e.g. cross-device), copy bytes directly
 		if err := copyFile(tmpPath, execPath); err != nil {
 			return fmt.Errorf("replace executable %s: %w", execPath, err)
 		}
 	}
 
-	log.Printf("agent: binary updated to version %s successfully at %s! Restarting...", header.Version, execPath)
+	log.Printf("agent: ✓ Successfully updated sshhub-agent from GitHub to %s! Restarting...", execPath)
 
-	// Attempt systemd restart if managed by systemd
 	if err := exec.Command("systemctl", "restart", "sshhub-agent").Start(); err == nil {
 		os.Exit(0)
 	}
 
-	// Fallback to in-place exec restart
 	return syscall.Exec(execPath, os.Args, os.Environ())
 }
 

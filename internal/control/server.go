@@ -2,16 +2,10 @@ package control
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/Trickhish/sshhub/internal/version"
 	"github.com/hashicorp/yamux"
@@ -114,11 +108,7 @@ func (s *Server) register(session *yamux.Session) (string, error) {
 		return "", &RegistrationError{Message: "invalid token"}
 	}
 
-	updateAvailable := false
-	agentBinPath := findAgentBinary()
-	if agentBinPath != "" && req.Version != "" && req.Version != version.Version {
-		updateAvailable = true
-	}
+	updateAvailable := req.Version != "" && req.Version != version.Version
 
 	resp := RegisterResponse{
 		OK:              true,
@@ -131,88 +121,5 @@ func (s *Server) register(session *yamux.Session) (string, error) {
 		return "", fmt.Errorf("write register response: %w", err)
 	}
 
-	if updateAvailable {
-		go s.serveAgentUpdate(session, backendID, agentBinPath)
-	}
-
 	return backendID, nil
-}
-
-func (s *Server) serveAgentUpdate(session *yamux.Session, backendID, binPath string) {
-	stream, err := session.AcceptStream()
-	if err != nil {
-		log.Printf("control: accept update stream for %s: %v", backendID, err)
-		return
-	}
-	defer stream.Close()
-
-	data, err := os.ReadFile(binPath)
-	if err != nil {
-		log.Printf("control: read agent binary %s: %v", binPath, err)
-		return
-	}
-
-	sum := sha256.Sum256(data)
-	shaHex := hex.EncodeToString(sum[:])
-	sig := getBinarySignature(binPath, shaHex)
-
-	header := UpdateHeader{
-		Version:   version.Version,
-		Size:      int64(len(data)),
-		SHA256:    shaHex,
-		Signature: sig,
-	}
-	if err := WriteUpdateHeader(stream, header); err != nil {
-		log.Printf("control: write update header to %s: %v", backendID, err)
-		return
-	}
-
-	if _, err := stream.Write(data); err != nil {
-		log.Printf("control: stream agent binary to %s: %v", backendID, err)
-		return
-	}
-
-	log.Printf("control: successfully pushed auto-update (v%s, %d bytes) to backend %q", version.Version, len(data), backendID)
-}
-
-func getBinarySignature(binPath, shaHex string) string {
-	// 1. Check for .sig file next to binary
-	sigPath := binPath + ".sig"
-	if data, err := os.ReadFile(sigPath); err == nil {
-		sig := strings.TrimSpace(string(data))
-		if sig != "" {
-			return sig
-		}
-	}
-
-	// 2. Check for release signing key to sign dynamically
-	keyHex := os.Getenv("SSHHUB_RELEASE_KEY")
-	if keyHex == "" {
-		if data, err := os.ReadFile("/etc/sshhub/release.key"); err == nil {
-			keyHex = strings.TrimSpace(string(data))
-		}
-	}
-	if keyHex != "" {
-		if privBytes, err := hex.DecodeString(keyHex); err == nil && len(privBytes) == ed25519.PrivateKeySize {
-			sig := ed25519.Sign(privBytes, []byte(shaHex))
-			return hex.EncodeToString(sig)
-		}
-	}
-	return ""
-}
-
-func findAgentBinary() string {
-	candidates := []string{
-		"/usr/local/bin/sshhub-agent",
-		"sshhub-agent",
-	}
-	if execPath, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(execPath), "sshhub-agent"))
-	}
-	for _, c := range candidates {
-		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
-			return c
-		}
-	}
-	return ""
 }

@@ -56,11 +56,10 @@ When using ProxyJump (`ssh -J hub.example.com worker1`):
 - Diffie-Hellman Key Exchange and public key authentication happen **end-to-end** directly between your local client and the backend server.
 - **Even if the central Hub is fully compromised**, an attacker cannot decrypt sessions, inject commands, or compromise backend nodes.
 
-### 2. Cryptographically Signed Auto-Updates (Ed25519)
-- `sshhub-agent` automatically updates itself over the reverse control port when new versions are deployed to the Hub.
-- **Supply Chain Protection**: Every binary update is cryptographically signed using an offline **Developer Ed25519 Private Key**.
-- `sshhub-agent` has the corresponding Developer Public Key hardcoded in its binary and **strictly verifies the cryptographic signature** before executing or installing any update.
-- **The Private Signing Key NEVER lives on the Hub**: The Hub only stores and distributes pre-signed `.sig` artifacts. Even if an attacker gains root on the Hub and replaces the binary, connected agents will detect the invalid signature, abort the update, and stay secure.
+### 2. Verified HTTPS Auto-Updates via GitHub
+- `sshhub-agent` automatically updates itself when a new release is published.
+- When an update is detected, the agent fetches the verified binary directly from **GitHub Releases over TLS/HTTPS**.
+- **Zero-Friction & Secure**: The Hub only notifies connected nodes of new versions. Even if the Hub were compromised, it cannot push arbitrary malicious binaries because the agent downloads official releases directly from GitHub.
 
 ---
 
@@ -68,7 +67,7 @@ When using ProxyJump (`ssh -J hub.example.com worker1`):
 
 - **Zero-Config Direct SSH:** Access private backends using `ssh backend@hub` or `ssh user@backend@hub`.
 - **CLI Management (`sshhub-ctl`):** Easily add or remove backend nodes with auto-generated secure tokens.
-- **1-Line Installers & Signed Auto-Updates:** Quick automated setup and cryptographically verified in-band updates over the control port.
+- **1-Line Installers & Auto-Updates:** Quick automated setup and GitHub HTTPS-verified auto-updates.
 - **Token-Identified Backends:** Each backend is bound to its unique secret token. Agents do not need to manage or pass their own ID.
 - **Node-Level Key Authorization:** The endpoint `sshhub-agent` verifies the user's public key against local `/root/.ssh/authorized_keys`.
 - **Embedded PTY Management:** Native pseudo-terminal allocation with dynamic window resize (`SIGWINCH`), interactive shells, and command execution.
@@ -190,23 +189,6 @@ routes:
   - username: "*"
     backend: worker1
 ```
-
-## Developer: Signing Releases
-
-When compiling a new `sshhub-agent` binary for distribution, sign it on your **local developer machine** using your private key:
-
-```sh
-# 1. Build new agent
-go build -o sshhub-agent ./cmd/sshhub-agent
-
-# 2. Sign binary (generates sshhub-agent.sig)
-./scripts/sign-binary.sh ./sshhub-agent /path/to/release.priv
-
-# 3. Upload binary and signature to the Hub
-scp sshhub-agent sshhub-agent.sig hub:/usr/local/bin/
-```
-
-Connected agents will automatically download, verify the Ed25519 signature against their embedded public key, and upgrade seamlessly.
 
 ## Building
 
