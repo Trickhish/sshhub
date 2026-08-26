@@ -2,3 +2,4 @@
 .env
 /sshhub
 /sshhub-agent
+/sshhub-ctl

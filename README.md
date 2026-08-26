@@ -33,6 +33,7 @@ It supports two operating models:
 ## Features
 
 - **Zero-Config Direct SSH:** Access private backends using `ssh backend@hub` or `ssh user@backend@hub`.
+- **CLI Management (`sshhub-ctl`):** Easily add or remove backend nodes with auto-generated secure tokens.
 - **Token-Identified Backends:** Each backend is bound to its unique secret token. Agents do not need to manage or pass their own ID.
 - **Node-Level Key Authorization:** The endpoint `sshhub-agent` verifies the user's public key against local `/root/.ssh/authorized_keys`.
 - **Embedded PTY Management:** Native pseudo-terminal allocation with dynamic window resize (`SIGWINCH`), interactive shells, and command execution.
@@ -75,6 +76,44 @@ Then simply connect:
 ```sh
 ssh cidev
 ```
+
+## CLI Management (`sshhub-ctl`)
+
+`sshhub-ctl` lets you manage backends directly from the command line on the central hub.
+
+### Adding a new backend
+Generates a secure cryptographic token, registers the backend and its route in `/etc/sshhub/sshhub.yaml`, reloads the service, and outputs the ready-to-run agent command:
+
+```sh
+sshhub-ctl add worker1 --hub cdn.srv.dury.dev:7000
+```
+
+Output:
+```text
+✓ Backend "worker1" successfully registered in /etc/sshhub/sshhub.yaml
+
+Generated Token:
+  AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k
+
+To start the agent on "worker1", run:
+  sshhub-agent --hub cdn.srv.dury.dev:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
+
+To connect from your client:
+  ssh worker1@cdn.srv.dury.dev
+  ssh root@worker1@cdn.srv.dury.dev
+```
+
+### Listing backends
+```sh
+sshhub-ctl list
+```
+
+### Removing a backend
+```sh
+sshhub-ctl remove worker1
+```
+
+*(A standalone script `scripts/add-backend.sh` is also included for environments without the Go binary).*
 
 ## Routing Rules & Cheat Sheet
 
@@ -123,6 +162,7 @@ Requires Go 1.22+.
 ```sh
 go build -o sshhub ./cmd/sshhub
 go build -o sshhub-agent ./cmd/sshhub-agent
+go build -o sshhub-ctl ./cmd/sshhub-ctl
 ```
 
 ## Configuration
