@@ -76,6 +76,46 @@ Then simply connect:
 ssh cidev
 ```
 
+## Routing Rules & Cheat Sheet
+
+Rules in `routes:` are evaluated **top to bottom** (first match wins):
+
+| Pattern | YAML Rule | Matching SSH Commands |
+| :--- | :--- | :--- |
+| **Specific `user@server`**<br>*(Only a specific user on a specific node)* | ```yaml\n- username: "alice"\n  hostname: "cidev"\n  backend: cidev\n``` | `ssh alice@cidev@hub` |
+| **`*@server` (Any user on `server`)**<br>*(Any user connecting to `@server`)* | ```yaml\n- hostname: "cidev"\n  backend: cidev\n``` | `ssh root@cidev@hub`<br>`ssh alice@cidev@hub` |
+| **Direct server name**<br>*(Login user is the server name without `@`)* | ```yaml\n- username: "cidev"\n  backend: cidev\n``` | `ssh cidev@hub` |
+| **Wildcard hosts (`web*`, `*.prod`)**<br>*(Glob pattern matching)* | ```yaml\n- hostname: "web*"\n  backend: web-cluster\n``` | `ssh root@web1@hub`<br>`ssh deploy@web-prod@hub` |
+| **Catch-All `*`**<br>*(Default fallback if nothing else matched)* | ```yaml\n- username: "*"\n  backend: cidev\n``` | Any connection that didn't match rules above |
+
+### Example Configuration
+
+```yaml
+routes:
+  # 1. Specific user on specific host
+  - username: "backup"
+    hostname: "db1"
+    backend: db1
+
+  # 2. Any user on a specific host (root@cidev, alice@cidev, etc.)
+  - hostname: "cidev"
+    backend: cidev
+
+  - hostname: "web1"
+    backend: web1
+
+  # 3. Direct server name (ssh cidev@hub or ssh web1@hub)
+  - username: "cidev"
+    backend: cidev
+
+  - username: "web1"
+    backend: web1
+
+  # 4. Fallback if nothing else matched
+  - username: "*"
+    backend: cidev
+```
+
 ## Building
 
 Requires Go 1.22+.
