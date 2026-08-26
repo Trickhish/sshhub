@@ -16,7 +16,7 @@ usage() {
   echo "  Update:        $0"
   echo ""
   echo "Example:"
-  echo "  curl -sSL https://raw.githubusercontent.com/${REPO}/main/scripts/install-agent.sh | sudo bash"
+  echo "  curl -sSL https://raw.githubusercontent.com/${REPO}/main/scripts/install-agent.sh | sudo bash -s -- --hub hub.example.com:7000 --token \"<token>\""
   exit 1
 }
 
@@ -79,9 +79,24 @@ if [[ -f "$SERVICE_FILE" ]]; then
   fi
 fi
 
-if [[ -z "$HUB" || -z "$TOKEN" ]]; then
-  echo "Error: Both --hub and --token are required for fresh installation." >&2
-  usage
+# If still missing and interactive, prompt the user
+if [[ -z "$HUB" && -t 0 ]]; then
+  read -rp "Enter SSHub Hub address (e.g. hub.example.com:7000): " HUB
+fi
+
+if [[ -z "$TOKEN" && -t 0 ]]; then
+  read -rp "Enter Agent registration token: " TOKEN
+fi
+
+# If still missing, fail with a clear error
+if [[ -z "$HUB" ]]; then
+  echo "Error: Hub address is required. Specify with --hub <hub-host:7000>" >&2
+  exit 1
+fi
+
+if [[ -z "$TOKEN" ]]; then
+  echo "Error: Registration token is required. Specify with --token <token>" >&2
+  exit 1
 fi
 
 echo "==> Installing / Updating SSHub Agent..."
@@ -112,9 +127,7 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 # 4. Stop service before binary replacement if currently running
-WAS_RUNNING=false
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet sshhub-agent; then
-  WAS_RUNNING=true
   systemctl stop sshhub-agent || true
 fi
 

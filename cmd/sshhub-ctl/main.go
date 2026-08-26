@@ -204,7 +204,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  sshhub-ctl add worker1")
-	fmt.Println("  sshhub-ctl add web2 --hub cdn.srv.dury.dev:7000")
+	fmt.Println("  sshhub-ctl add web2 --hub hub.example.com:7000")
 	fmt.Println("  sshhub-ctl list")
 	fmt.Println("  sshhub-ctl remove worker1")
 }

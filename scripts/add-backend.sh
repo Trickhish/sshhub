@@ -8,7 +8,7 @@ RAW_INSTALL_URL="https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <backend-id> [hub-address:7000]"
-  echo "Example: $0 worker1 cdn.srv.dury.dev:7000"
+  echo "Example: $0 worker1 hub.example.com:7000"
   exit 1
 fi
 
