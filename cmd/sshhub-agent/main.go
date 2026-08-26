@@ -16,14 +16,14 @@ import (
 func main() {
 	hub := flag.String("hub", "", "hub control address (host:port)")
 	token := flag.String("token", "", "control plane token")
-	backend := flag.String("backend", "", "backend id to register")
+	backend := flag.String("backend", "", "optional backend id override")
 	sshd := flag.String("sshd", "", "optional local sshd address to bridge to (if omitted, agent serves sessions natively)")
 	useTLS := flag.Bool("tls", false, "connect to the hub over TLS")
 	insecure := flag.Bool("tls-insecure-skip-verify", false, "skip TLS certificate verification")
 	flag.Parse()
 
-	if *hub == "" || *token == "" || *backend == "" {
-		log.Fatal("--hub, --token, and --backend are required")
+	if *hub == "" || *token == "" {
+		log.Fatal("--hub and --token are required")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -34,11 +34,11 @@ func main() {
 		tlsConfig = &tls.Config{InsecureSkipVerify: *insecure} // #nosec G402 -- opt-in for self-signed certs
 	}
 
-	session, err := control.Connect(ctx, *hub, *backend, *token, tlsConfig)
+	session, assignedBackend, err := control.Connect(ctx, *hub, *backend, *token, tlsConfig)
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}
-	log.Printf("registered backend %q with %s", *backend, *hub)
+	log.Printf("registered backend %q with %s", assignedBackend, *hub)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

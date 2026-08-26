@@ -10,20 +10,22 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
+// TokenResolver validates a registration token and resolves it to a backend ID.
+type TokenResolver func(token, requestedBackend string) (backendID string, ok bool)
+
 // Server is the hub side of the control plane.
 type Server struct {
-	registry   *Registry
-	checkToken func(token string) bool
-	tlsConfig  *tls.Config
+	registry     *Registry
+	resolveToken TokenResolver
+	tlsConfig    *tls.Config
 }
 
-// NewServer builds a Server. checkToken reports whether a presented token is
-// authorized. tlsConfig may be nil for a plaintext listener.
-func NewServer(registry *Registry, checkToken func(string) bool, tlsConfig *tls.Config) *Server {
+// NewServer builds a Server. resolveToken resolves a presented token to an assigned backend ID.
+func NewServer(registry *Registry, resolveToken TokenResolver, tlsConfig *tls.Config) *Server {
 	return &Server{
-		registry:   registry,
-		checkToken: checkToken,
-		tlsConfig:  tlsConfig,
+		registry:     registry,
+		resolveToken: resolveToken,
+		tlsConfig:    tlsConfig,
 	}
 }
 
@@ -94,17 +96,19 @@ func (s *Server) register(session *yamux.Session) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read register request: %w", err)
 	}
-	if req.Backend == "" {
-		WriteResponse(stream, RegisterResponse{OK: false, Error: "backend id is required"})
-		return "", &RegistrationError{Message: "backend id is required"}
+	if req.Token == "" {
+		WriteResponse(stream, RegisterResponse{OK: false, Error: "token is required"})
+		return "", &RegistrationError{Message: "token is required"}
 	}
-	if !s.checkToken(req.Token) {
+
+	backendID, ok := s.resolveToken(req.Token, req.Backend)
+	if !ok {
 		WriteResponse(stream, RegisterResponse{OK: false, Error: "invalid token"})
 		return "", &RegistrationError{Message: "invalid token"}
 	}
 
-	if err := WriteResponse(stream, RegisterResponse{OK: true}); err != nil {
+	if err := WriteResponse(stream, RegisterResponse{OK: true, Backend: backendID}); err != nil {
 		return "", fmt.Errorf("write register response: %w", err)
 	}
-	return req.Backend, nil
+	return backendID, nil
 }

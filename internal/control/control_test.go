@@ -13,8 +13,11 @@ func TestControlPlaneRoundTrip(t *testing.T) {
 	defer cancel()
 
 	registry := NewRegistry()
-	server := NewServer(registry, func(token string) bool {
-		return token == "secret"
+	server := NewServer(registry, func(token, requestedBackend string) (string, bool) {
+		if token == "secret-token" {
+			return "db1", true
+		}
+		return "", false
 	}, nil)
 
 	// Pick a free port.
@@ -50,11 +53,16 @@ func TestControlPlaneRoundTrip(t *testing.T) {
 	// Give the hub listener a moment to start.
 	time.Sleep(100 * time.Millisecond)
 
-	session, err := Connect(ctx, addr, "db1", "secret", nil)
+	// Agent connects without specifying backend ID, hub assigns "db1"
+	session, assignedBackend, err := Connect(ctx, addr, "", "secret-token", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer session.Close()
+
+	if assignedBackend != "db1" {
+		t.Fatalf("expected assigned backend db1, got %q", assignedBackend)
+	}
 
 	go Serve(ctx, session, echoLn.Addr().String())
 
@@ -94,8 +102,11 @@ func TestConnectRejectsBadToken(t *testing.T) {
 	defer cancel()
 
 	registry := NewRegistry()
-	server := NewServer(registry, func(token string) bool {
-		return token == "secret"
+	server := NewServer(registry, func(token, requestedBackend string) (string, bool) {
+		if token == "secret" {
+			return "db1", true
+		}
+		return "", false
 	}, nil)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -109,7 +120,7 @@ func TestConnectRejectsBadToken(t *testing.T) {
 	go func() { done <- server.ListenAndServe(ctx, addr) }()
 	time.Sleep(100 * time.Millisecond)
 
-	if _, err := Connect(ctx, addr, "db1", "wrong", nil); err == nil {
+	if _, _, err := Connect(ctx, addr, "db1", "wrong", nil); err == nil {
 		t.Fatal("expected registration error")
 	}
 }

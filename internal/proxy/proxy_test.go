@@ -206,17 +206,22 @@ func TestDirectSession_AgentAuth(t *testing.T) {
 	controlAddr := controlLn.Addr().String()
 	controlLn.Close()
 
-	controlServer := control.NewServer(registry, func(token string) bool { return token == "secret" }, nil)
+	controlServer := control.NewServer(registry, func(token, reqBackend string) (string, bool) {
+		if token == "secret" {
+			return "cidev", true
+		}
+		return "", false
+	}, nil)
 	go controlServer.ListenAndServe(ctx, controlAddr)
 
 	cfg := &config.Config{
 		Listen:  config.Listen{SSH: "127.0.0.1:0", Control: controlAddr},
 		HostKey: hostKey,
 		Backends: []config.Backend{
-			{ID: "cidev", Mode: "reverse"},
+			{ID: "cidev", Mode: "reverse", Token: "secret"},
 		},
 		Routes: []config.Route{
-			{Match: config.Match{Username: "*"}, Backend: "cidev"},
+			{Username: "*", Backend: "cidev"},
 		},
 	}
 
@@ -234,7 +239,7 @@ func TestDirectSession_AgentAuth(t *testing.T) {
 	go server.Serve(ctx, sshAddr)
 
 	time.Sleep(100 * time.Millisecond)
-	session, err := control.Connect(ctx, controlAddr, "cidev", "secret", nil)
+	session, _, err := control.Connect(ctx, controlAddr, "", "secret", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

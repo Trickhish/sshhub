@@ -29,7 +29,19 @@ func main() {
 
 	controlServer := control.NewServer(
 		registry,
-		func(token string) bool { return slices.Contains(cfg.ControlTokens, token) },
+		func(token, requestedBackend string) (string, bool) {
+			// 1. Resolve by per-backend token
+			if b := cfg.BackendByToken(token); b != nil {
+				return b.ID, true
+			}
+			// 2. Check global control_tokens with requested backend
+			if requestedBackend != "" && slices.Contains(cfg.ControlTokens, token) {
+				if b := cfg.BackendByID(requestedBackend); b != nil && b.Mode == "reverse" {
+					return b.ID, true
+				}
+			}
+			return "", false
+		},
 		controlTLS(cfg),
 	)
 

@@ -11,8 +11,9 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
-// Connect dials the hub, registers the backend, and returns a live session.
-func Connect(ctx context.Context, hubAddr, backend, token string, tlsConfig *tls.Config) (*yamux.Session, error) {
+// Connect dials the hub, registers with the given token (and optional backend id),
+// and returns a live session and the backend ID assigned by the hub.
+func Connect(ctx context.Context, hubAddr, backend, token string, tlsConfig *tls.Config) (*yamux.Session, string, error) {
 	var conn net.Conn
 	var err error
 	if tlsConfig != nil {
@@ -26,42 +27,47 @@ func Connect(ctx context.Context, hubAddr, backend, token string, tlsConfig *tls
 		conn, err = d.DialContext(ctx, "tcp", hubAddr)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("dial hub: %w", err)
+		return nil, "", fmt.Errorf("dial hub: %w", err)
 	}
 
 	session, err := yamux.Client(conn, yamux.DefaultConfig())
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("open yamux session: %w", err)
+		return nil, "", fmt.Errorf("open yamux session: %w", err)
 	}
 
-	if err := register(session, backend, token); err != nil {
+	assignedBackend, err := register(session, backend, token)
+	if err != nil {
 		session.Close()
-		return nil, err
+		return nil, "", err
 	}
-	return session, nil
+	return session, assignedBackend, nil
 }
 
-// register opens a control stream, sends the registration request, and checks
-// the hub's response.
-func register(session *yamux.Session, backend, token string) error {
+// register opens a control stream, sends the registration request, and returns
+// the assigned backend id.
+func register(session *yamux.Session, backend, token string) (string, error) {
 	stream, err := session.OpenStream()
 	if err != nil {
-		return fmt.Errorf("open registration stream: %w", err)
+		return "", fmt.Errorf("open registration stream: %w", err)
 	}
 	defer stream.Close()
 
 	if err := WriteRegister(stream, RegisterRequest{Backend: backend, Token: token}); err != nil {
-		return fmt.Errorf("write register request: %w", err)
+		return "", fmt.Errorf("write register request: %w", err)
 	}
 	resp, err := ReadResponse(stream)
 	if err != nil {
-		return fmt.Errorf("read register response: %w", err)
+		return "", fmt.Errorf("read register response: %w", err)
 	}
 	if !resp.OK {
-		return &RegistrationError{Message: resp.Error}
+		return "", &RegistrationError{Message: resp.Error}
 	}
-	return nil
+	assigned := resp.Backend
+	if assigned == "" {
+		assigned = backend
+	}
+	return assigned, nil
 }
 
 // Serve bridges incoming streams to the local sshd until the session closes.

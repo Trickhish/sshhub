@@ -1,9 +1,8 @@
 // Package control implements the control plane between the hub and agents.
 //
 // Agents dial the hub's control listener and open a yamux session. The agent
-// opens a single registration stream carrying its backend id and a shared
-// token. Once registered, the hub opens additional yamux streams that the
-// agent bridges to its local sshd.
+// opens a single registration stream presenting its token. Once registered,
+// the hub opens additional yamux streams that the agent uses to execute sessions.
 package control
 
 import (
@@ -14,14 +13,15 @@ import (
 
 // RegisterRequest is sent by an agent over its registration stream.
 type RegisterRequest struct {
-	Backend string `json:"backend"`
+	Backend string `json:"backend,omitempty"`
 	Token   string `json:"token"`
 }
 
 // RegisterResponse is the hub's reply to a RegisterRequest.
 type RegisterResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	OK      bool   `json:"ok"`
+	Backend string `json:"backend,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // WriteRegister encodes a RegisterRequest onto the stream.

@@ -30,6 +30,7 @@ type Listen struct {
 type Backend struct {
 	ID          string `yaml:"id"`
 	Mode        string `yaml:"mode"` // "direct" or "reverse"
+	Token       string `yaml:"token"` // per-backend token for reverse mode
 	Address     string `yaml:"address"`
 	Username    string `yaml:"username"`
 	Auth        Auth   `yaml:"auth"`
@@ -44,9 +45,13 @@ type Auth struct {
 }
 
 // Route maps a matching request to a backend.
+// Supports both flat route syntax (hostname, username, backend)
+// and nested match blocks (match: { hostname, username }, backend).
 type Route struct {
-	Match   Match  `yaml:"match"`
-	Backend string `yaml:"backend"`
+	Match    Match  `yaml:"match"`
+	Backend  string `yaml:"backend"`
+	Username string `yaml:"username"`
+	Hostname string `yaml:"hostname"`
 }
 
 // Match is the set of routing predicates. Empty values are wildcards.
@@ -72,7 +77,7 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
-// Validate checks the configuration for structural errors.
+// Validate checks the configuration for structural errors and normalizes route syntax.
 func (c *Config) Validate() error {
 	if c.Listen.SSH == "" {
 		return fmt.Errorf("listen.ssh is required")
@@ -88,6 +93,7 @@ func (c *Config) Validate() error {
 	}
 
 	seen := make(map[string]bool)
+	seenTokens := make(map[string]string)
 	for i := range c.Backends {
 		b := &c.Backends[i]
 		if b.ID == "" {
@@ -97,6 +103,13 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate backend id %q", b.ID)
 		}
 		seen[b.ID] = true
+
+		if b.Token != "" {
+			if existingID, ok := seenTokens[b.Token]; ok {
+				return fmt.Errorf("duplicate token for backends %q and %q", existingID, b.ID)
+			}
+			seenTokens[b.Token] = b.ID
+		}
 
 		switch b.Mode {
 		case "direct":
@@ -115,6 +128,14 @@ func (c *Config) Validate() error {
 	}
 	for i := range c.Routes {
 		r := &c.Routes[i]
+		// Normalize flat syntax into Match
+		if r.Username != "" && r.Match.Username == "" {
+			r.Match.Username = r.Username
+		}
+		if r.Hostname != "" && r.Match.Hostname == "" {
+			r.Match.Hostname = r.Hostname
+		}
+
 		if r.Backend == "" {
 			return fmt.Errorf("route %d: backend is required", i)
 		}
@@ -130,6 +151,20 @@ func (c *Config) BackendByID(id string) *Backend {
 	for i := range c.Backends {
 		if c.Backends[i].ID == id {
 			return &c.Backends[i]
+		}
+	}
+	return nil
+}
+
+// BackendByToken returns the reverse backend configured with the given token, or nil.
+func (c *Config) BackendByToken(token string) *Backend {
+	if token == "" {
+		return nil
+	}
+	for i := range c.Backends {
+		b := &c.Backends[i]
+		if b.Mode == "reverse" && b.Token == token {
+			return b
 		}
 	}
 	return nil

@@ -20,10 +20,12 @@ backends:
     address: "10.0.0.10:22"
   - id: db1
     mode: reverse
+    token: "token-db1"
 routes:
-  - match:
-      username: "*"
+  - hostname: "web1"
     backend: web1
+  - username: "*"
+    backend: db1
 `
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
@@ -38,6 +40,12 @@ routes:
 	}
 	if len(c.Backends) != 2 || c.Backends[1].Mode != "reverse" {
 		t.Fatalf("unexpected backends: %+v", c.Backends)
+	}
+	if b := c.BackendByToken("token-db1"); b == nil || b.ID != "db1" {
+		t.Fatalf("expected backend db1 for token-db1, got %+v", b)
+	}
+	if len(c.Routes) != 2 || c.Routes[0].Match.Hostname != "web1" {
+		t.Fatalf("unexpected normalized routes: %+v", c.Routes)
 	}
 }
 
@@ -61,6 +69,14 @@ func TestValidateErrors(t *testing.T) {
 			Backends: []Backend{
 				{ID: "b", Mode: "reverse"},
 				{ID: "b", Mode: "reverse"},
+			},
+		}},
+		{"duplicate token", Config{
+			Listen:  Listen{SSH: ":22", Control: ":7000"},
+			HostKey: "/k",
+			Backends: []Backend{
+				{ID: "b1", Mode: "reverse", Token: "tok"},
+				{ID: "b2", Mode: "reverse", Token: "tok"},
 			},
 		}},
 		{"unknown route backend", Config{

@@ -6,21 +6,21 @@ point for accessing private servers behind NATs and firewalls.
 It supports two operating models:
 
 1. **Direct 1-Command SSH Access (Zero Client Config)**:
-   - Connect straight with `ssh -p 2222 cidev@cdn.srv.dury.dev` or `ssh -p 2222 root@cidev@cdn.srv.dury.dev`.
+   - Connect straight with `ssh cidev@cdn.srv.dury.dev` or `ssh root@cidev@cdn.srv.dury.dev`.
    - The Hub routes the session to `sshhub-agent` on the backend node.
    - `sshhub-agent` validates the client's public key against local `/root/.ssh/authorized_keys`, allocates a native PTY, and launches the shell.
    - The Hub stores **zero credentials or backdoor keys**.
 
 2. **Layer-4 ProxyJump Passthrough**:
-   - `ssh -J cdn.srv.dury.dev:2222 root@cidev`
+   - `ssh -J cdn.srv.dury.dev root@cidev`
    - Bridges raw `direct-tcpip` streams directly to an existing OpenSSH daemon.
 
 ```
                           ┌────────────────────────────┐
                           │        sshhub (hub)        │
                           │                            │
-   ssh -p 2222 cidev@hub ─▶│  :2222 SSH listener       │
-   ssh -J hub backend   ──▶│  :7000 control listener   │
+   ssh cidev@hub ────────▶│  :22   SSH listener        │
+   ssh -J hub backend ───▶│  :7000 control listener   │
                           └───────┬────────────┬───────┘
                           direct  │            │ reverse
                           dial    │            │ (agents dial in)
@@ -32,7 +32,8 @@ It supports two operating models:
 
 ## Features
 
-- **Zero-Config Direct SSH:** Access private backends using `ssh -p 2222 backend@hub` or `ssh -p 2222 user@backend@hub`.
+- **Zero-Config Direct SSH:** Access private backends using `ssh backend@hub` or `ssh user@backend@hub`.
+- **Token-Identified Backends:** Each backend is bound to its unique secret token. Agents do not need to manage or pass their own ID.
 - **Node-Level Key Authorization:** The endpoint `sshhub-agent` verifies the user's public key against local `/root/.ssh/authorized_keys`.
 - **Embedded PTY Management:** Native pseudo-terminal allocation with dynamic window resize (`SIGWINCH`), interactive shells, and command execution.
 - **No Inbound Open Ports Required:** Backend nodes establish outbound reverse yamux tunnels to the hub.
@@ -45,20 +46,20 @@ It supports two operating models:
 
 ```sh
 # Login directly to backend "cidev" as root
-ssh -p 2222 cidev@cdn.srv.dury.dev
+ssh cidev@cdn.srv.dury.dev
 
 # Specify a custom remote user with user@backend
-ssh -p 2222 root@cidev@cdn.srv.dury.dev
-ssh -p 2222 alice@web1@cdn.srv.dury.dev
+ssh root@cidev@cdn.srv.dury.dev
+ssh alice@web1@cdn.srv.dury.dev
 
 # Run non-interactive commands
-ssh -p 2222 cidev@cdn.srv.dury.dev "hostname -f && uptime"
+ssh cidev@cdn.srv.dury.dev "hostname -f && uptime"
 ```
 
 ### 2. Using ProxyJump (`-J`)
 
 ```sh
-ssh -J cdn.srv.dury.dev:2222 root@cidev
+ssh -J cdn.srv.dury.dev root@cidev
 ```
 
 ### 3. Using `~/.ssh/config`
@@ -66,7 +67,6 @@ ssh -J cdn.srv.dury.dev:2222 root@cidev
 ```sshconfig
 Host cidev
   HostName cdn.srv.dury.dev
-  Port 2222
   User cidev
 ```
 
@@ -91,41 +91,45 @@ The hub is configured with `/etc/sshhub/sshhub.yaml`:
 
 ```yaml
 listen:
-  ssh: ":2222"      # where SSH clients connect
+  ssh: ":22"        # where SSH clients connect
   control: ":7000"  # where agents connect (reverse mode)
 
 host_key: "/etc/sshhub/ssh_host_ed25519_key"
 
-control_tokens:
-  - "sshhub-token-secret-2026"
-
 backends:
   - id: cidev
     mode: reverse
+    token: "TNgPdS6pc0V7I0iSyP0Rclvy82txSuy7qm0FdtNKIcY="
+
+  - id: web1
+    mode: direct
+    address: "10.0.0.10:22"
 
 routes:
-  - match:
-      hostname: "cidev"
+  - hostname: "cidev"
     backend: cidev
-  - match:
-      username: "*"
+
+  - hostname: "web1"
+    backend: web1
+
+  - username: "*"
     backend: cidev
 ```
 
 ### Running an agent (reverse mode)
 
+The agent only needs `--hub` and its assigned `--token`:
+
 ```sh
 # Native PTY execution mode (default, no sshd needed)
 sshhub-agent \
   --hub cdn.srv.dury.dev:7000 \
-  --token sshhub-token-secret-2026 \
-  --backend cidev
+  --token "TNgPdS6pc0V7I0iSyP0Rclvy82txSuy7qm0FdtNKIcY="
 
 # Or optional bridge mode to an existing local sshd daemon
 sshhub-agent \
   --hub cdn.srv.dury.dev:7000 \
-  --token sshhub-token-secret-2026 \
-  --backend cidev \
+  --token "TNgPdS6pc0V7I0iSyP0Rclvy82txSuy7qm0FdtNKIcY=" \
   --sshd 127.0.0.1:22
 ```
 
