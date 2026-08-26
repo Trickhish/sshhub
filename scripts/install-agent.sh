@@ -9,11 +9,20 @@ SERVICE_FILE="/etc/systemd/system/sshhub-agent.service"
 HUB=""
 TOKEN=""
 SSHD=""
+REBUILD=false
+VERSION="latest"
 
 usage() {
   echo "Usage:"
-  echo "  Fresh install: $0 --hub <hub-host:7000> --token <token> [--sshd <127.0.0.1:22>]"
-  echo "  Update:        $0"
+  echo "  Fresh install: $0 --hub <hub-host:7000> --token <token> [options]"
+  echo "  Update:        $0 [options]"
+  echo ""
+  echo "Options:"
+  echo "  --hub <host:port>     SSHub Hub control listener address (e.g. hub.example.com:7000)"
+  echo "  --token <token>       Authentication token generated on the Hub"
+  echo "  --sshd <host:port>    Target OpenSSH daemon address (default: embedded native agent)"
+  echo "  --build, --rebuild    Force compilation from source instead of downloading release"
+  echo "  --version <vX.Y.Z>    Target release version (default: latest stable release)"
   echo ""
   echo "Example:"
   echo "  curl -sSL https://raw.githubusercontent.com/${REPO}/main/scripts/install-agent.sh | sudo bash -s -- --hub hub.example.com:7000 --token \"<token>\""
@@ -45,6 +54,14 @@ while [[ $# -gt 0 ]]; do
       SSHD="$2"
       shift 2
       ;;
+    --version)
+      VERSION="$2"
+      shift 2
+      ;;
+    --build|--rebuild|--from-source)
+      REBUILD=true
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -73,7 +90,6 @@ if [[ -f "$SERVICE_FILE" ]]; then
   if [[ -z "$SSHD" ]]; then
     SSHD="$(extract_flag "sshd" "$SERVICE_FILE")"
   fi
-
   if [[ -n "$HUB" && -n "$TOKEN" ]]; then
     echo "--> Detected existing agent config: hub=${HUB}"
   fi
@@ -118,11 +134,11 @@ esac
 # 3. Ensure dependencies
 if ! command -v curl >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq && apt-get install -y -qq curl git
+    apt-get update -qq && apt-get install -y -qq curl tar
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q curl git
+    dnf install -y -q curl tar
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y -q curl git
+    yum install -y -q curl tar
   fi
 fi
 
@@ -141,11 +157,33 @@ trap cleanup EXIT
 
 INSTALLED=false
 
-RELEASE_URL="https://github.com/${REPO}/releases/latest/download/sshhub-agent-linux-${GOARCH}.tar.gz"
-if curl -fsSL -I "$RELEASE_URL" >/dev/null 2>&1; then
-  echo "--> Downloading prebuilt agent from GitHub releases..."
-  curl -fsSL "$RELEASE_URL" | tar -xz -C "$INSTALL_DIR"
-  INSTALLED=true
+if [[ "$REBUILD" = false ]]; then
+  ASSET_NAME="sshhub-agent-linux-${GOARCH}.tar.gz"
+  API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+  if [[ "$VERSION" != "latest" ]]; then
+    TAG="$VERSION"
+    [[ ! "$TAG" =~ ^v ]] && TAG="v${TAG}"
+    API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
+  fi
+
+  echo "--> Fetching latest release binary from GitHub..."
+  DOWNLOAD_URL=""
+  if RELEASE_JSON="$(curl -fsSL -H "User-Agent: sshhub-installer" "$API_URL" 2>/dev/null)"; then
+    DOWNLOAD_URL="$(echo "$RELEASE_JSON" | grep -o "\"browser_download_url\":[[:space:]]*\"[^\"]*${ASSET_NAME}[^\"]*\"" | head -n 1 | cut -d'"' -f4 || true)"
+  fi
+
+  if [[ -z "$DOWNLOAD_URL" ]]; then
+    if [[ "$VERSION" == "latest" ]]; then
+      DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}"
+    else
+      DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET_NAME}"
+    fi
+  fi
+
+  if curl -fsSL -H "User-Agent: sshhub-installer" "$DOWNLOAD_URL" | tar -xz -C "$INSTALL_DIR" 2>/dev/null; then
+    echo "✓ Downloaded and installed release from GitHub!"
+    INSTALLED=true
+  fi
 fi
 
 if [[ "$INSTALLED" = false ]]; then
