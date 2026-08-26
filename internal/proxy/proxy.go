@@ -4,9 +4,9 @@
 // or ssh -p 2222 root@cidev@hub) with full interactive shells, PTYs, exec, and signals,
 // or connect via ProxyJump (-J) / direct-tcpip.
 //
-// In direct session mode, the hub delegates authentication to the backend agent, which
-// checks the connecting client's actual public key against the local authorized_keys file
-// before spawning a PTY or shell. The hub has no credentials of its own.
+// In direct session mode, the hub delegates authentication to the backend agent in real-time,
+// checking the connecting client's actual public key against the backend's local authorized_keys
+// file during the SSH handshake before accepting the key or spawning a PTY.
 package proxy
 
 import (
@@ -40,8 +40,41 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 		return nil, err
 	}
 
+	s := &Server{
+		cfg:      cfg,
+		registry: registry,
+		router:   routing.New(cfg.Routes),
+	}
+
 	sshConfig := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			backendID, targetUser := s.resolveBackendAndUser(conn.User(), "")
+			if backendID == "" {
+				return nil, fmt.Errorf("no route for user %q", conn.User())
+			}
+			backend := s.cfg.BackendByID(backendID)
+			if backend == nil {
+				return nil, fmt.Errorf("backend %q not found", backendID)
+			}
+
+			// If hub has authorized_keys configured, check hub filter first
+			if cfg.AuthorizedKeys != "" {
+				keys, err := loadAuthorizedKeys(cfg.AuthorizedKeys)
+				if err != nil {
+					return nil, err
+				}
+				if _, ok := keys[string(key.Marshal())]; !ok {
+					return nil, fmt.Errorf("unknown public key on hub")
+				}
+			}
+
+			// Verify with backend agent in real-time during the handshake for reverse backends
+			if backend.Mode == "reverse" {
+				if err := s.verifyBackendAgentKey(backend, targetUser, key); err != nil {
+					return nil, fmt.Errorf("unauthorized key for backend %s", backendID)
+				}
+			}
+
 			return &ssh.Permissions{
 				Extensions: map[string]string{
 					"user":   conn.User(),
@@ -59,32 +92,47 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 		},
 	}
 
-	if cfg.AuthorizedKeys != "" {
-		keys, err := loadAuthorizedKeys(cfg.AuthorizedKeys)
-		if err != nil {
-			return nil, err
-		}
-		sshConfig.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if _, ok := keys[string(key.Marshal())]; ok {
-				return &ssh.Permissions{
-					Extensions: map[string]string{
-						"user":   conn.User(),
-						"pubkey": string(ssh.MarshalAuthorizedKey(key)),
-					},
-				}, nil
-			}
-			return nil, fmt.Errorf("unknown public key")
-		}
+	sshConfig.AddHostKey(hostKey)
+	s.sshConfig = sshConfig
+
+	return s, nil
+}
+
+// verifyBackendAgentKey validates the client's public key with the backend agent during the handshake.
+func (s *Server) verifyBackendAgentKey(backend *config.Backend, targetUser string, key ssh.PublicKey) error {
+	rawConn, err := s.dialBackend(backend)
+	if err != nil {
+		return err
+	}
+	defer rawConn.Close()
+
+	user := targetUser
+	if user == "" {
+		user = backend.Username
+	}
+	if user == "" {
+		user = "root"
 	}
 
-	sshConfig.AddHostKey(hostKey)
+	pubkeyStr := string(ssh.MarshalAuthorizedKey(key))
+	clientConfig := &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(pubkeyStr),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
 
-	return &Server{
-		cfg:       cfg,
-		registry:  registry,
-		router:    routing.New(cfg.Routes),
-		sshConfig: sshConfig,
-	}, nil
+	agentConn, chans, reqs, err := ssh.NewClientConn(rawConn, backend.ID, clientConfig)
+	if err != nil {
+		return err
+	}
+	_ = agentConn.Close()
+	go ssh.DiscardRequests(reqs)
+	for ch := range chans {
+		ch.Reject(ssh.Prohibited, "auth check only")
+	}
+	return nil
 }
 
 // Serve accepts SSH client connections until ctx is canceled.
@@ -206,7 +254,7 @@ func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 		return
 	}
 
-	// Dial the backend agent and pass the client's verified public key for authorization
+	// Dial the backend agent and pass the client's verified public key for session creation
 	backendConn, backendChans, backendReqs, err := s.dialBackendAgent(backend, targetUser, serverConn.Permissions)
 	if err != nil {
 		log.Printf("ssh: backend %q auth failed for user %q: %v", backendID, targetUser, err)
