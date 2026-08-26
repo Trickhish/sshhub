@@ -7,7 +7,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"runtime"
 
+	"github.com/Trickhish/sshhub/internal/version"
 	"github.com/hashicorp/yamux"
 )
 
@@ -53,7 +55,15 @@ func register(session *yamux.Session, backend, token string) (string, error) {
 	}
 	defer stream.Close()
 
-	if err := WriteRegister(stream, RegisterRequest{Backend: backend, Token: token}); err != nil {
+	req := RegisterRequest{
+		Backend: backend,
+		Token:   token,
+		Version: version.Version,
+		OS:      runtime.GOOS,
+		Arch:    runtime.GOARCH,
+	}
+
+	if err := WriteRegister(stream, req); err != nil {
 		return "", fmt.Errorf("write register request: %w", err)
 	}
 	resp, err := ReadResponse(stream)
@@ -63,6 +73,16 @@ func register(session *yamux.Session, backend, token string) (string, error) {
 	if !resp.OK {
 		return "", &RegistrationError{Message: resp.Error}
 	}
+
+	if resp.UpdateAvailable {
+		log.Printf("agent: new version %s available from hub (current %s). Downloading auto-update...", resp.LatestVersion, version.Version)
+		go func() {
+			if err := RequestAndApplyUpdate(session); err != nil {
+				log.Printf("agent: update failed: %v", err)
+			}
+		}()
+	}
+
 	assigned := resp.Backend
 	if assigned == "" {
 		assigned = backend

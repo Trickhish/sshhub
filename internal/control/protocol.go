@@ -2,7 +2,8 @@
 //
 // Agents dial the hub's control listener and open a yamux session. The agent
 // opens a single registration stream presenting its token. Once registered,
-// the hub opens additional yamux streams that the agent uses to execute sessions.
+// the hub opens additional yamux streams that the agent uses to execute sessions
+// or receive automatic binary updates.
 package control
 
 import (
@@ -15,13 +16,25 @@ import (
 type RegisterRequest struct {
 	Backend string `json:"backend,omitempty"`
 	Token   string `json:"token"`
+	Version string `json:"version,omitempty"`
+	OS      string `json:"os,omitempty"`
+	Arch    string `json:"arch,omitempty"`
 }
 
 // RegisterResponse is the hub's reply to a RegisterRequest.
 type RegisterResponse struct {
-	OK      bool   `json:"ok"`
-	Backend string `json:"backend,omitempty"`
-	Error   string `json:"error,omitempty"`
+	OK              bool   `json:"ok"`
+	Backend         string `json:"backend,omitempty"`
+	Error           string `json:"error,omitempty"`
+	UpdateAvailable bool   `json:"update_available,omitempty"`
+	LatestVersion   string `json:"latest_version,omitempty"`
+}
+
+// UpdateHeader describes an update payload sent over an update stream.
+type UpdateHeader struct {
+	Version string `json:"version"`
+	Size    int64  `json:"size"`
+	SHA256  string `json:"sha256"`
 }
 
 // WriteRegister encodes a RegisterRequest onto the stream.
@@ -51,6 +64,20 @@ func ReadResponse(r io.Reader) (RegisterResponse, error) {
 		return resp, err
 	}
 	return resp, nil
+}
+
+// WriteUpdateHeader encodes an UpdateHeader onto the stream.
+func WriteUpdateHeader(w io.Writer, header UpdateHeader) error {
+	return json.NewEncoder(w).Encode(header)
+}
+
+// ReadUpdateHeader decodes an UpdateHeader from the stream.
+func ReadUpdateHeader(r io.Reader) (UpdateHeader, error) {
+	var header UpdateHeader
+	if err := json.NewDecoder(r).Decode(&header); err != nil {
+		return header, err
+	}
+	return header, nil
 }
 
 // RegistrationError reports a registration failure with its message.
