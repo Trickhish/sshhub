@@ -44,9 +44,8 @@ func writeFile(t *testing.T, dir, name, content string) string {
 	return path
 }
 
-// startBackend runs a minimal SSH server that accepts allowedKey and echoes
-// "hello" on every exec. It returns the listener address and host key signer.
-func startBackend(t *testing.T, allowedKey ssh.PublicKey) (string, ssh.Signer) {
+// startBackend runs an SSH server that accepts allowedKey directly and echoes "hello" on exec.
+func startBackend(t *testing.T, allowedKey ssh.PublicKey) (string, ssh.PublicKey) {
 	t.Helper()
 	hostSigner, _ := generateKey(t)
 
@@ -55,7 +54,7 @@ func startBackend(t *testing.T, allowedKey ssh.PublicKey) (string, ssh.Signer) {
 			if string(key.Marshal()) == string(allowedKey.Marshal()) {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("unauthorized")
+			return nil, fmt.Errorf("unauthorized key on backend")
 		},
 	}
 	serverConfig.AddHostKey(hostSigner)
@@ -75,7 +74,7 @@ func startBackend(t *testing.T, allowedKey ssh.PublicKey) (string, ssh.Signer) {
 			go handleBackendConn(conn, serverConfig)
 		}
 	}()
-	return ln.Addr().String(), hostSigner
+	return ln.Addr().String(), hostSigner.PublicKey()
 }
 
 func handleBackendConn(conn net.Conn, cfg *ssh.ServerConfig) {
@@ -100,73 +99,124 @@ func handleBackendChannel(newCh ssh.NewChannel) {
 	if err != nil {
 		return
 	}
-	defer ch.Close()
 	for req := range reqs {
 		switch req.Type {
 		case "exec":
 			req.Reply(true, nil)
 			ch.Write([]byte("hello"))
 			ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{}))
+			ch.Close()
 			return
+		case "shell":
+			req.Reply(true, nil)
+			ch.Write([]byte("welcome shell"))
+			ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{}))
+			ch.Close()
+			return
+		case "pty-req":
+			req.Reply(true, nil)
 		default:
 			req.Reply(false, nil)
 		}
 	}
 }
 
-// runSession dials addr with signer, runs "exec", and returns the output.
-func runSession(t *testing.T, addr, user string, signer ssh.Signer) string {
+// runDirectSSH dials hub directly (e.g. ssh user@hub or ssh backend@hub) and runs exec.
+func runDirectSSH(t *testing.T, hubAddr, loginUser string, clientSigner ssh.Signer) string {
 	t.Helper()
-	client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+	var auth []ssh.AuthMethod
+	if clientSigner != nil {
+		auth = []ssh.AuthMethod{ssh.PublicKeys(clientSigner)}
+	}
+	client, err := ssh.Dial("tcp", hubAddr, &ssh.ClientConfig{
+		User:            loginUser,
+		Auth:            auth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("dial hub: %v", err)
 	}
 	defer client.Close()
 
 	session, err := client.NewSession()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("new session: %v", err)
 	}
 	defer session.Close()
+
 	out, err := session.Output("echo hi")
 	if err != nil {
-		t.Fatalf("run: %v", err)
+		t.Fatalf("exec: %v", err)
 	}
 	return string(out)
 }
 
-func TestProxyDirect(t *testing.T) {
-	clientSigner, _ := generateKey(t)
-	_, hubHostPEM := generateKey(t)
-	hubBackendSigner, hubBackendPEM := generateKey(t)
+// runProxyJump dials hub and opens direct-tcpip channel.
+func runProxyJump(t *testing.T, hubAddr, hubUser string, hubSigner ssh.Signer, target, backendUser string, backendSigner ssh.Signer) string {
+	t.Helper()
+	var auth []ssh.AuthMethod
+	if hubSigner != nil {
+		auth = []ssh.AuthMethod{ssh.PublicKeys(hubSigner)}
+	}
+	hubClient, err := ssh.Dial("tcp", hubAddr, &ssh.ClientConfig{
+		User:            hubUser,
+		Auth:            auth,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatalf("dial hub: %v", err)
+	}
+	defer hubClient.Close()
 
-	backendAddr, backendHost := startBackend(t, hubBackendSigner.PublicKey())
+	conn, err := hubClient.Dial("tcp", target)
+	if err != nil {
+		t.Fatalf("dial direct-tcpip %q: %v", target, err)
+	}
+	defer conn.Close()
+
+	ncc, chans, reqs, err := ssh.NewClientConn(conn, target, &ssh.ClientConfig{
+		User:            backendUser,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(backendSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatalf("backend handshake: %v", err)
+	}
+	backendClient := ssh.NewClient(ncc, chans, reqs)
+	defer backendClient.Close()
+
+	session, err := backendClient.NewSession()
+	if err != nil {
+		t.Fatalf("new backend session: %v", err)
+	}
+	defer session.Close()
+
+	out, err := session.Output("echo hi")
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	return string(out)
+}
+
+func TestDirectSSH_DirectBackend(t *testing.T) {
+	clientSigner, _ := generateKey(t)
+	hubHostSigner, hubHostPEM := generateKey(t)
+
+	// Backend authorizes the hub's host key
+	backendAddr, _ := startBackend(t, hubHostSigner.PublicKey())
 
 	dir := t.TempDir()
-	authorizedKeys := writeFile(t, dir, "authorized_keys", string(ssh.MarshalAuthorizedKey(clientSigner.PublicKey())))
 	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
-	backendKey := writeFile(t, dir, "backend_key", hubBackendPEM)
 
 	cfg := &config.Config{
-		Listen:         config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
-		HostKey:        hostKey,
-		AuthorizedKeys: authorizedKeys,
+		Listen:  config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
+		HostKey: hostKey,
 		Backends: []config.Backend{
-			{
-				ID:       "web1",
-				Mode:     "direct",
-				Address:  backendAddr,
-				Username: "root",
-				Auth:     config.Auth{PrivateKey: backendKey},
-				HostKey:  string(ssh.MarshalAuthorizedKey(backendHost.PublicKey())),
-			},
+			{ID: "web1", Mode: "direct", Address: backendAddr},
 		},
 		Routes: []config.Route{
-			{Match: config.Match{Username: "alice"}, Backend: "web1"},
+			{Match: config.Match{Username: "deploy", Hostname: "web1"}, Backend: "web1"},
+			{Match: config.Match{Username: "*"}, Backend: "web1"},
 		},
 	}
 
@@ -187,26 +237,28 @@ func TestProxyDirect(t *testing.T) {
 	go server.Serve(ctx, addr)
 	time.Sleep(100 * time.Millisecond)
 
-	if out := runSession(t, addr, "alice", clientSigner); out != "hello" {
+	// 1. Test connecting directly with backend ID as user: "ssh web1@hub"
+	if out := runDirectSSH(t, addr, "web1", clientSigner); out != "hello" {
+		t.Fatalf("got %q, want %q", out, "hello")
+	}
+
+	// 2. Test connecting with user@host: "ssh deploy@web1@hub"
+	if out := runDirectSSH(t, addr, "deploy@web1", clientSigner); out != "hello" {
 		t.Fatalf("got %q, want %q", out, "hello")
 	}
 }
 
-func TestProxyReverse(t *testing.T) {
+func TestDirectSSH_ReverseBackend(t *testing.T) {
 	clientSigner, _ := generateKey(t)
-	_, hubHostPEM := generateKey(t)
-	hubBackendSigner, hubBackendPEM := generateKey(t)
+	hubHostSigner, hubHostPEM := generateKey(t)
 
-	backendAddr, backendHost := startBackend(t, hubBackendSigner.PublicKey())
+	backendAddr, _ := startBackend(t, hubHostSigner.PublicKey())
 
 	dir := t.TempDir()
-	authorizedKeys := writeFile(t, dir, "authorized_keys", string(ssh.MarshalAuthorizedKey(clientSigner.PublicKey())))
 	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
-	backendKey := writeFile(t, dir, "backend_key", hubBackendPEM)
 
 	registry := control.NewRegistry()
 
-	// Control plane: start hub listener and connect an agent.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -221,20 +273,13 @@ func TestProxyReverse(t *testing.T) {
 	go controlServer.ListenAndServe(ctx, controlAddr)
 
 	cfg := &config.Config{
-		Listen:         config.Listen{SSH: "127.0.0.1:0", Control: controlAddr},
-		HostKey:        hostKey,
-		AuthorizedKeys: authorizedKeys,
+		Listen:  config.Listen{SSH: "127.0.0.1:0", Control: controlAddr},
+		HostKey: hostKey,
 		Backends: []config.Backend{
-			{
-				ID:       "db1",
-				Mode:     "reverse",
-				Username: "root",
-				Auth:     config.Auth{PrivateKey: backendKey},
-				HostKey:  string(ssh.MarshalAuthorizedKey(backendHost.PublicKey())),
-			},
+			{ID: "cidev", Mode: "reverse"},
 		},
 		Routes: []config.Route{
-			{Match: config.Match{Username: "bob"}, Backend: "db1"},
+			{Match: config.Match{Username: "*"}, Backend: "cidev"},
 		},
 	}
 
@@ -251,19 +296,17 @@ func TestProxyReverse(t *testing.T) {
 	sshLn.Close()
 	go server.Serve(ctx, sshAddr)
 
-	// Connect the agent and bridge to the backend sshd.
 	time.Sleep(100 * time.Millisecond)
-	session, err := control.Connect(ctx, controlAddr, "db1", "secret", nil)
+	session, err := control.Connect(ctx, controlAddr, "cidev", "secret", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer session.Close()
 	go control.Serve(ctx, session, backendAddr)
 
-	// Wait for the registry to record the backend.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, err := registry.Open(ctx, "db1"); err == nil {
+		if _, err := registry.Open(ctx, "cidev"); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -272,7 +315,57 @@ func TestProxyReverse(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if out := runSession(t, sshAddr, "bob", clientSigner); out != "hello" {
+	// Test: "ssh -p 2222 cidev@hub"
+	if out := runDirectSSH(t, sshAddr, "cidev", clientSigner); out != "hello" {
+		t.Fatalf("got %q, want %q", out, "hello")
+	}
+
+	// Test: "ssh -p 2222 root@cidev@hub"
+	if out := runDirectSSH(t, sshAddr, "root@cidev", clientSigner); out != "hello" {
+		t.Fatalf("got %q, want %q", out, "hello")
+	}
+}
+
+func TestProxyJump_DirectAndReverse(t *testing.T) {
+	clientSigner, _ := generateKey(t)
+	_, hubHostPEM := generateKey(t)
+
+	// Backend expects client's key when using ProxyJump
+	backendAddr, _ := startBackend(t, clientSigner.PublicKey())
+
+	dir := t.TempDir()
+	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
+
+	cfg := &config.Config{
+		Listen:  config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
+		HostKey: hostKey,
+		Backends: []config.Backend{
+			{ID: "web1", Mode: "direct", Address: backendAddr},
+		},
+		Routes: []config.Route{
+			{Match: config.Match{Username: "*"}, Backend: "web1"},
+		},
+	}
+
+	server, err := New(cfg, control.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	go server.Serve(ctx, addr)
+	time.Sleep(100 * time.Millisecond)
+
+	out := runProxyJump(t, addr, "anyone", clientSigner, "web1:22", "root", clientSigner)
+	if out != "hello" {
 		t.Fatalf("got %q, want %q", out, "hello")
 	}
 }

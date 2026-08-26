@@ -92,17 +92,23 @@ func bridge(stream net.Conn, sshdAddr string) {
 	}
 	defer sshd.Close()
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 1)
+
+	// Stream -> sshd (stdin)
 	go func() {
-		_, err := io.Copy(sshd, stream)
-		errCh <- err
+		io.Copy(sshd, stream)
+		if tc, ok := sshd.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
 	}()
+
+	// sshd -> Stream (stdout/stderr)
 	go func() {
 		_, err := io.Copy(stream, sshd)
 		errCh <- err
 	}()
+
 	<-errCh
 	stream.Close()
 	sshd.Close()
-	<-errCh
 }
