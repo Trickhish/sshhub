@@ -4,6 +4,7 @@ set -euo pipefail
 
 CONFIG_FILE="${SSHHUB_CONFIG:-/etc/sshhub/sshhub.yaml}"
 HUB_ADDR="${SSHHUB_HUB:-}"
+RAW_INSTALL_URL="https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh"
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <backend-id> [hub-address:7000]"
@@ -33,8 +34,7 @@ if grep -q "id: \?[\"']\?${BACKEND_ID}[\"']\?" "$CONFIG_FILE"; then
   exit 1
 fi
 
-# Append backend entry before routes: or at end of backends
-# If yq is available, use it, otherwise use python3/awk/sed
+# Append backend entry and route
 if command -v python3 >/dev/null 2>&1; then
   python3 - <<EOF
 import yaml, sys
@@ -61,7 +61,6 @@ with open("$CONFIG_FILE", "w") as f:
     yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
 EOF
 else
-  # Fallback: append backend definition directly
   cat >> "$CONFIG_FILE" <<EOF
 
 # Added backend: $BACKEND_ID
@@ -76,18 +75,19 @@ if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet sshhub; t
   systemctl restart sshhub
 fi
 
+TARGET_HUB="${HUB_ADDR:-<hub-host>:7000}"
+
 echo ""
 echo "✓ Backend \"$BACKEND_ID\" successfully added to $CONFIG_FILE"
 echo ""
 echo "Generated Token:"
 echo "  $TOKEN"
 echo ""
-echo "To start the agent on \"$BACKEND_ID\", run:"
-if [[ -n "$HUB_ADDR" ]]; then
-  echo "  sshhub-agent --hub $HUB_ADDR --token \"$TOKEN\""
-else
-  echo "  sshhub-agent --hub <hub-host>:7000 --token \"$TOKEN\""
-fi
+echo "1-Line Agent Install Command (run on node \"$BACKEND_ID\"):"
+echo "  curl -sSL $RAW_INSTALL_URL | bash -s -- --hub $TARGET_HUB --token \"$TOKEN\""
+echo ""
+echo "Manual binary command:"
+echo "  sshhub-agent --hub $TARGET_HUB --token \"$TOKEN\""
 echo ""
 echo "To connect from your client:"
 echo "  ssh $BACKEND_ID@<hub-domain>"

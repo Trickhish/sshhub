@@ -30,10 +30,29 @@ It supports two operating models:
                     └────────────────┘      └─────────────────┘
 ```
 
+## Quick Install (1-Line Commands)
+
+### 1. Install Gateway Server (on your public VPS / Hub)
+
+```sh
+curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-server.sh | sudo bash
+```
+
+### 2. Install Agent (on your backend node / server behind NAT)
+
+```sh
+curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub <hub-host>:7000 --token "<token>"
+```
+
+*(Note: Run `sshhub-ctl add <backend-id>` on your Hub to automatically generate the token and the exact 1-line agent installer command).*
+
+---
+
 ## Features
 
 - **Zero-Config Direct SSH:** Access private backends using `ssh backend@hub` or `ssh user@backend@hub`.
 - **CLI Management (`sshhub-ctl`):** Easily add or remove backend nodes with auto-generated secure tokens.
+- **1-Line Installers:** Quick automated setup for both the Gateway Hub and Agent nodes with systemd service integration.
 - **Token-Identified Backends:** Each backend is bound to its unique secret token. Agents do not need to manage or pass their own ID.
 - **Node-Level Key Authorization:** The endpoint `sshhub-agent` verifies the user's public key against local `/root/.ssh/authorized_keys`.
 - **Embedded PTY Management:** Native pseudo-terminal allocation with dynamic window resize (`SIGWINCH`), interactive shells, and command execution.
@@ -82,7 +101,7 @@ ssh cidev
 `sshhub-ctl` lets you manage backends directly from the command line on the central hub.
 
 ### Adding a new backend
-Generates a secure cryptographic token, registers the backend and its route in `/etc/sshhub/sshhub.yaml`, reloads the service, and outputs the ready-to-run agent command:
+Generates a secure cryptographic token, registers the backend and its route in `/etc/sshhub/sshhub.yaml`, reloads the service, and outputs the ready-to-run 1-line install command:
 
 ```sh
 sshhub-ctl add worker1 --hub cdn.srv.dury.dev:7000
@@ -95,7 +114,10 @@ Output:
 Generated Token:
   AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k
 
-To start the agent on "worker1", run:
+1-Line Agent Install Command (run on node "worker1"):
+  curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | bash -s -- --hub cdn.srv.dury.dev:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
+
+Manual binary command:
   sshhub-agent --hub cdn.srv.dury.dev:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
 
 To connect from your client:
@@ -112,8 +134,6 @@ sshhub-ctl list
 ```sh
 sshhub-ctl remove worker1
 ```
-
-*(A standalone script `scripts/add-backend.sh` is also included for environments without the Go binary).*
 
 ## Routing Rules & Cheat Sheet
 
@@ -194,23 +214,6 @@ routes:
 
   - username: "*"
     backend: cidev
-```
-
-### Running an agent (reverse mode)
-
-The agent only needs `--hub` and its assigned `--token`:
-
-```sh
-# Native PTY execution mode (default, no sshd needed)
-sshhub-agent \
-  --hub cdn.srv.dury.dev:7000 \
-  --token "TNgPdS6pc0V7I0iSyP0Rclvy82txSuy7qm0FdtNKIcY="
-
-# Or optional bridge mode to an existing local sshd daemon
-sshhub-agent \
-  --hub cdn.srv.dury.dev:7000 \
-  --token "TNgPdS6pc0V7I0iSyP0Rclvy82txSuy7qm0FdtNKIcY=" \
-  --sshd 127.0.0.1:22
 ```
 
 ## License

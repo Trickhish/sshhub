@@ -2,7 +2,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +10,8 @@ import (
 
 	"github.com/Trickhish/sshhub/internal/config"
 )
+
+const repoRawURL = "https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -21,35 +22,59 @@ func main() {
 	cmd := os.Args[1]
 	switch cmd {
 	case "add":
-		addCmd := flag.NewFlagSet("add", flag.ExitOnError)
-		cfgPath := addCmd.String("config", defaultConfigPath(), "path to configuration file")
-		hubAddr := addCmd.String("hub", "", "public hub address (host:7000)")
-		customToken := addCmd.String("token", "", "custom token (generates secure token if empty)")
-		noRestart := addCmd.Bool("no-restart", false, "do not restart sshhub systemd service")
-		_ = addCmd.Parse(os.Args[2:])
+		var (
+			cfgPath     = defaultConfigPath()
+			hubAddr     = ""
+			customToken = ""
+			noRestart   = false
+			id          = ""
+		)
 
-		args := addCmd.Args()
-		if len(args) < 1 {
+		for i := 2; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			switch {
+			case arg == "--hub" && i+1 < len(os.Args):
+				hubAddr = os.Args[i+1]
+				i++
+			case strings.HasPrefix(arg, "--hub="):
+				hubAddr = strings.TrimPrefix(arg, "--hub=")
+			case arg == "--token" && i+1 < len(os.Args):
+				customToken = os.Args[i+1]
+				i++
+			case strings.HasPrefix(arg, "--token="):
+				customToken = strings.TrimPrefix(arg, "--token=")
+			case arg == "--config" && i+1 < len(os.Args):
+				cfgPath = os.Args[i+1]
+				i++
+			case strings.HasPrefix(arg, "--config="):
+				cfgPath = strings.TrimPrefix(arg, "--config=")
+			case arg == "--no-restart":
+				noRestart = true
+			case !strings.HasPrefix(arg, "-") && id == "":
+				id = arg
+			}
+		}
+
+		if id == "" {
 			log.Fatal("usage: sshhub-ctl add <backend-id> [--config <path>] [--hub <host:port>] [--token <custom-token>]")
 		}
-		id := args[0]
 
-		token, err := config.AddBackend(*cfgPath, id, *customToken)
+		token, err := config.AddBackend(cfgPath, id, customToken)
 		if err != nil {
 			log.Fatalf("error: %v", err)
 		}
 
-		if !*noRestart {
+		if !noRestart {
 			_ = exec.Command("systemctl", "try-restart", "sshhub").Run()
 		}
 
-		hub := *hubAddr
+		hub := hubAddr
 		if hub == "" {
-			if cfg, err := config.Load(*cfgPath); err == nil && cfg.Listen.Control != "" {
+			if cfg, err := config.Load(cfgPath); err == nil && cfg.Listen.Control != "" {
 				control := cfg.Listen.Control
 				if strings.HasPrefix(control, ":") {
-					hostname, _ := os.Hostname()
-					hub = hostname + control
+					host := getFQDN()
+					hub = host + control
 				} else {
 					hub = control
 				}
@@ -60,12 +85,15 @@ func main() {
 		}
 
 		fmt.Println()
-		fmt.Printf("✓ Backend %q successfully registered in %s\n", id, *cfgPath)
+		fmt.Printf("✓ Backend %q successfully registered in %s\n", id, cfgPath)
 		fmt.Println()
 		fmt.Println("Generated Token:")
 		fmt.Printf("  %s\n", token)
 		fmt.Println()
-		fmt.Printf("To start the agent on %q, run:\n", id)
+		fmt.Printf("1-Line Agent Install Command (run on node %q):\n", id)
+		fmt.Printf("  curl -sSL %s | sudo bash -s -- --hub %s --token %q\n", repoRawURL, hub, token)
+		fmt.Println()
+		fmt.Printf("Manual binary command:\n")
 		fmt.Printf("  sshhub-agent --hub %s --token %q\n", hub, token)
 		fmt.Println()
 		fmt.Println("To connect from your client:")
@@ -74,36 +102,55 @@ func main() {
 		fmt.Println()
 
 	case "remove", "rm":
-		rmCmd := flag.NewFlagSet("remove", flag.ExitOnError)
-		cfgPath := rmCmd.String("config", defaultConfigPath(), "path to configuration file")
-		noRestart := rmCmd.Bool("no-restart", false, "do not restart sshhub systemd service")
-		_ = rmCmd.Parse(os.Args[2:])
+		cfgPath := defaultConfigPath()
+		noRestart := false
+		id := ""
 
-		args := rmCmd.Args()
-		if len(args) < 1 {
+		for i := 2; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			switch {
+			case arg == "--config" && i+1 < len(os.Args):
+				cfgPath = os.Args[i+1]
+				i++
+			case strings.HasPrefix(arg, "--config="):
+				cfgPath = strings.TrimPrefix(arg, "--config=")
+			case arg == "--no-restart":
+				noRestart = true
+			case !strings.HasPrefix(arg, "-") && id == "":
+				id = arg
+			}
+		}
+
+		if id == "" {
 			log.Fatal("usage: sshhub-ctl remove <backend-id> [--config <path>]")
 		}
-		id := args[0]
 
-		if err := config.RemoveBackend(*cfgPath, id); err != nil {
+		if err := config.RemoveBackend(cfgPath, id); err != nil {
 			log.Fatalf("error: %v", err)
 		}
-		if !*noRestart {
+		if !noRestart {
 			_ = exec.Command("systemctl", "try-restart", "sshhub").Run()
 		}
-		fmt.Printf("✓ Backend %q removed from %s\n", id, *cfgPath)
+		fmt.Printf("✓ Backend %q removed from %s\n", id, cfgPath)
 
 	case "list", "ls":
-		lsCmd := flag.NewFlagSet("list", flag.ExitOnError)
-		cfgPath := lsCmd.String("config", defaultConfigPath(), "path to configuration file")
-		_ = lsCmd.Parse(os.Args[2:])
+		cfgPath := defaultConfigPath()
+		for i := 2; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			if arg == "--config" && i+1 < len(os.Args) {
+				cfgPath = os.Args[i+1]
+				i++
+			} else if strings.HasPrefix(arg, "--config=") {
+				cfgPath = strings.TrimPrefix(arg, "--config=")
+			}
+		}
 
-		cfg, err := config.Load(*cfgPath)
+		cfg, err := config.Load(cfgPath)
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
 
-		fmt.Printf("Backends configured in %s:\n\n", *cfgPath)
+		fmt.Printf("Backends configured in %s:\n\n", cfgPath)
 		fmt.Printf("%-15s %-10s %-15s %s\n", "ID", "MODE", "ADDRESS", "TOKEN")
 		fmt.Printf("%-15s %-10s %-15s %s\n", "---------------", "----------", "---------------", "------------------------------------------")
 		for _, b := range cfg.Backends {
@@ -123,6 +170,17 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+func getFQDN() string {
+	if out, err := exec.Command("hostname", "-f").Output(); err == nil {
+		fqdn := strings.TrimSpace(string(out))
+		if fqdn != "" {
+			return fqdn
+		}
+	}
+	h, _ := os.Hostname()
+	return h
 }
 
 func defaultConfigPath() string {
