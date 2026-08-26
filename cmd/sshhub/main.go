@@ -10,9 +10,11 @@ import (
 	"os/signal"
 	"slices"
 	"syscall"
+	"time"
 
 	"github.com/Trickhish/sshhub/internal/config"
 	"github.com/Trickhish/sshhub/internal/control"
+	"github.com/Trickhish/sshhub/internal/hubupdate"
 	"github.com/Trickhish/sshhub/internal/proxy"
 )
 
@@ -63,6 +65,9 @@ func main() {
 			log.Fatalf("ssh: %v", err)
 		}
 	}()
+
+	// Start background auto-updater for the Hub gateway
+	hubupdate.StartAutoUpdater(6 * time.Hour)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

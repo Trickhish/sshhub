@@ -1,4 +1,4 @@
-// Command sshhub-ctl manages backends and tokens in the sshhub configuration.
+// Command sshhub-ctl manages backends, tokens, and updates for sshhub.
 package main
 
 import (
@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/Trickhish/sshhub/internal/config"
+	"github.com/Trickhish/sshhub/internal/hubupdate"
+	"github.com/Trickhish/sshhub/internal/version"
 )
 
 const repoRawURL = "https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh"
@@ -192,6 +194,58 @@ func main() {
 		}
 		fmt.Println()
 
+	case "update", "upgrade":
+		targetVersion := ""
+		checkOnly := false
+		for i := 2; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			switch {
+			case arg == "--check":
+				checkOnly = true
+			case arg == "--version" && i+1 < len(os.Args):
+				targetVersion = os.Args[i+1]
+				i++
+			case strings.HasPrefix(arg, "--version="):
+				targetVersion = strings.TrimPrefix(arg, "--version=")
+			}
+		}
+
+		fmt.Printf("Current version: %s\n", version.Version)
+		fmt.Print("Checking for updates on GitHub... ")
+		latest, err := hubupdate.FetchLatestVersion()
+		if err != nil {
+			fmt.Printf("failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("latest release is %s\n", latest)
+
+		if !hubupdate.IsNewer(latest, version.Version) && targetVersion == "" {
+			fmt.Println("✓ SSHub Gateway is already up to date!")
+			return
+		}
+
+		if checkOnly {
+			fmt.Printf("Update available: %s -> %s\n", version.Version, latest)
+			return
+		}
+
+		verToInstall := latest
+		if targetVersion != "" {
+			verToInstall = targetVersion
+		}
+
+		fmt.Printf("Downloading and applying %s from GitHub...\n", verToInstall)
+		if err := hubupdate.DownloadAndApplyHubUpdate(verToInstall); err != nil {
+			log.Fatalf("update failed: %v", err)
+		}
+
+		fmt.Println("Restarting sshhub service...")
+		_ = exec.Command("systemctl", "try-restart", "sshhub").Run()
+		fmt.Printf("✓ SSHub Gateway successfully updated to %s!\n", verToInstall)
+
+	case "version", "-v", "--version":
+		fmt.Printf("sshhub version %s\n", version.Version)
+
 	default:
 		printUsage()
 		os.Exit(1)
@@ -227,10 +281,13 @@ func printUsage() {
 	fmt.Println("  add <id>     Add a new reverse backend, generate token, and update config")
 	fmt.Println("  remove <id>  Remove a backend and its routes from config")
 	fmt.Println("  list         List all configured backends and tokens")
+	fmt.Println("  update       Check for and apply updates from GitHub Releases")
+	fmt.Println("  version      Show current version")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  sshhub-ctl add worker1")
-	fmt.Println("  sshhub-ctl add web2 --hub hub.example.com:7000")
 	fmt.Println("  sshhub-ctl list")
+	fmt.Println("  sshhub-ctl update")
+	fmt.Println("  sshhub-ctl update --check")
 	fmt.Println("  sshhub-ctl remove worker1")
 }
