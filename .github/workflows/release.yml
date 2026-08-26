@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release Assets
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build Binaries (${{ matrix.goos }}-${{ matrix.goarch }})
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w" -o dist/sshhub ./cmd/sshhub
+          go build -ldflags="-s -w" -o dist/sshhub-agent ./cmd/sshhub-agent
+          go build -ldflags="-s -w" -o dist/sshhub-ctl ./cmd/sshhub-ctl
+
+      - name: Package Release Archives
+        run: |
+          mkdir -p release
+          tar -czvf release/sshhub-agent-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C dist sshhub-agent
+          tar -czvf release/sshhub-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C dist sshhub sshhub-ctl
+          tar -czvf release/sshhub-all-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C dist sshhub sshhub-agent sshhub-ctl
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release/*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download All Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-release
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
