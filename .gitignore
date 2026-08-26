@@ -2,6 +2,7 @@
 .env
 *.priv
 *.key
+*.sig
 /sshhub
 /sshhub-agent
 /sshhub-ctl
