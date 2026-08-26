@@ -11,6 +11,7 @@ import (
 // Config is the top-level sshhub hub configuration.
 type Config struct {
 	Listen         Listen    `yaml:"listen"`
+	PublicHost     string    `yaml:"public_host,omitempty"`
 	HostKey        string    `yaml:"host_key"`
 	AuthorizedKeys string    `yaml:"authorized_keys,omitempty"`
 	TLSCert        string    `yaml:"tls_cert,omitempty"`

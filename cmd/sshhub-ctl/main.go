@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -70,18 +71,43 @@ func main() {
 
 		hub := hubAddr
 		if hub == "" {
-			if cfg, err := config.Load(cfgPath); err == nil && cfg.Listen.Control != "" {
-				control := cfg.Listen.Control
-				if strings.HasPrefix(control, ":") {
-					host := getFQDN()
-					hub = host + control
-				} else {
-					hub = control
+			if cfg, err := config.Load(cfgPath); err == nil {
+				if cfg.PublicHost != "" {
+					if strings.Contains(cfg.PublicHost, ":") {
+						hub = cfg.PublicHost
+					} else {
+						port := "7000"
+						if cfg.Listen.Control != "" {
+							if _, p, err := net.SplitHostPort(cfg.Listen.Control); err == nil {
+								port = p
+							} else if strings.HasPrefix(cfg.Listen.Control, ":") {
+								port = strings.TrimPrefix(cfg.Listen.Control, ":")
+							}
+						}
+						hub = net.JoinHostPort(cfg.PublicHost, port)
+					}
+				} else if cfg.Listen.Control != "" {
+					control := cfg.Listen.Control
+					if strings.HasPrefix(control, ":") {
+						host := getFQDN()
+						hub = host + control
+					} else {
+						hub = control
+					}
 				}
 			}
 		}
 		if hub == "" {
 			hub = "<hub-host>:7000"
+		}
+
+		domain := "<hub-domain>"
+		if hub != "" && hub != "<hub-host>:7000" {
+			if h, _, err := net.SplitHostPort(hub); err == nil {
+				domain = h
+			} else {
+				domain = hub
+			}
 		}
 
 		fmt.Println()
@@ -97,8 +123,8 @@ func main() {
 		fmt.Printf("  sshhub-agent --hub %s --token %q\n", hub, token)
 		fmt.Println()
 		fmt.Println("To connect from your client:")
-		fmt.Printf("  ssh %s@<hub-domain>\n", id)
-		fmt.Printf("  ssh root@%s@<hub-domain>\n", id)
+		fmt.Printf("  ssh %s@%s\n", id, domain)
+		fmt.Printf("  ssh root@%s@%s\n", id, domain)
 		fmt.Println()
 
 	case "remove", "rm":
