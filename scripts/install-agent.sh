@@ -127,8 +127,11 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 # 4. Stop service before binary replacement if currently running
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet sshhub-agent; then
-  systemctl stop sshhub-agent || true
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+  if systemctl is-active --quiet sshhub-agent; then
+    systemctl stop sshhub-agent || true
+  fi
 fi
 
 # 5. Install / Update binary
