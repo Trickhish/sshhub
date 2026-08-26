@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install-agent.sh: 1-line installer for SSHub Agent (Client/Node)
+# install-agent.sh: 1-line installer and updater for SSHub Agent (Client/Node)
 set -euo pipefail
 
 REPO="Trickhish/sshhub"
@@ -11,10 +11,23 @@ TOKEN=""
 SSHD=""
 
 usage() {
-  echo "Usage: $0 --hub <hub-host:7000> --token <token> [--sshd <127.0.0.1:22>]"
+  echo "Usage:"
+  echo "  Fresh install: $0 --hub <hub-host:7000> --token <token> [--sshd <127.0.0.1:22>]"
+  echo "  Update:        $0"
+  echo ""
   echo "Example:"
-  echo "  $0 --hub cdn.srv.dury.dev:7000 --token \"TNgPdS6...\""
+  echo "  curl -sSL https://raw.githubusercontent.com/${REPO}/main/scripts/install-agent.sh | sudo bash"
   exit 1
+}
+
+# Helper to extract flag values from existing service file
+extract_flag() {
+  local flag="$1"
+  local file="$2"
+  if [[ ! -f "$file" ]]; then
+    return
+  fi
+  sed -n "s/.*--${flag}[ =][\"'[:space:]]*\([^\"'[:space:]]*\).*/\1/p" "$file" | head -n 1
 }
 
 # Parse flags or positional arguments
@@ -49,12 +62,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# If flags not provided, check for existing installation configuration
+if [[ -f "$SERVICE_FILE" ]]; then
+  if [[ -z "$HUB" ]]; then
+    HUB="$(extract_flag "hub" "$SERVICE_FILE")"
+  fi
+  if [[ -z "$TOKEN" ]]; then
+    TOKEN="$(extract_flag "token" "$SERVICE_FILE")"
+  fi
+  if [[ -z "$SSHD" ]]; then
+    SSHD="$(extract_flag "sshd" "$SERVICE_FILE")"
+  fi
+
+  if [[ -n "$HUB" && -n "$TOKEN" ]]; then
+    echo "--> Detected existing agent config: hub=${HUB}"
+  fi
+fi
+
 if [[ -z "$HUB" || -z "$TOKEN" ]]; then
-  echo "Error: Both --hub and --token are required." >&2
+  echo "Error: Both --hub and --token are required for fresh installation." >&2
   usage
 fi
 
-echo "==> Installing SSHub Agent..."
+echo "==> Installing / Updating SSHub Agent..."
 
 # 1. Check Root
 if [[ $EUID -ne 0 ]]; then
@@ -81,7 +111,14 @@ if ! command -v curl >/dev/null 2>&1; then
   fi
 fi
 
-# 4. Install binary
+# 4. Stop service before binary replacement if currently running
+WAS_RUNNING=false
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet sshhub-agent; then
+  WAS_RUNNING=true
+  systemctl stop sshhub-agent || true
+fi
+
+# 5. Install / Update binary
 TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
@@ -112,7 +149,7 @@ fi
 
 chmod +x "${INSTALL_DIR}/sshhub-agent"
 
-# 5. Create Systemd Service
+# 6. Create or update Systemd Service
 EXEC_CMD="${INSTALL_DIR}/sshhub-agent --hub ${HUB} --token ${TOKEN}"
 if [[ -n "$SSHD" ]]; then
   EXEC_CMD="${EXEC_CMD} --sshd ${SSHD}"
@@ -141,5 +178,5 @@ EOF
 fi
 
 echo ""
-echo "✓ SSHub Agent installed and connected to ${HUB}!"
+echo "✓ SSHub Agent installed/updated and connected to ${HUB}!"
 echo ""
