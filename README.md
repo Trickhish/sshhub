@@ -1,5 +1,21 @@
 # sshhub
 
+### Quick 1-Line Install
+
+**1. Install Gateway Server (on your public VPS / Hub):**
+```sh
+curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-server.sh | sudo bash
+```
+
+**2. Install Agent (on your backend node / server behind NAT):**
+```sh
+curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub <hub-host>:7000 --token "<token>"
+```
+
+*(Run `sshhub-ctl add <backend-id>` on your Hub to auto-generate the token and the exact copy-paste agent install command).*
+
+---
+
 SSHub is an SSH gateway and reverse access platform that provides a single entry
 point for accessing private servers behind NATs and firewalls.
 
@@ -29,24 +45,6 @@ It supports two operating models:
                     │ (reachable)    │      │ (behind NAT)    │
                     └────────────────┘      └─────────────────┘
 ```
-
-## Quick Install (1-Line Commands)
-
-### 1. Install Gateway Server (on your public VPS / Hub)
-
-```sh
-curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-server.sh | sudo bash
-```
-
-### 2. Install Agent (on your backend node / server behind NAT)
-
-```sh
-curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub <hub-host>:7000 --token "<token>"
-```
-
-*(Note: Run `sshhub-ctl add <backend-id>` on your Hub to automatically generate the token and the exact 1-line agent installer command).*
-
----
 
 ## Features
 
@@ -115,7 +113,7 @@ Generated Token:
   AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k
 
 1-Line Agent Install Command (run on node "worker1"):
-  curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | bash -s -- --hub cdn.srv.dury.dev:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
+  curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub cdn.srv.dury.dev:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
 
 Manual binary command:
   sshhub-agent --hub cdn.srv.dury.dev:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
