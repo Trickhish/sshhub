@@ -33,38 +33,43 @@ type githubAsset struct {
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
+var defaultTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:       5 * time.Second,
+		KeepAlive:     30 * time.Second,
+		FallbackDelay: 100 * time.Millisecond,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          10,
+	IdleConnTimeout:       30 * time.Second,
+	TLSHandshakeTimeout:   5 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
 func newHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:       5 * time.Second,
-				KeepAlive:     30 * time.Second,
-				FallbackDelay: 100 * time.Millisecond, // fast Happy Eyeballs IPv4 fallback
-			}).DialContext,
-		},
+		Timeout:   timeout,
+		Transport: defaultTransport,
 	}
 }
 
 // FetchLatestVersion queries GitHub for the latest release tag.
 func FetchLatestVersion() (string, error) {
-	client := newHTTPClient(10 * time.Second)
-
 	// 1. Check direct release redirect header (instant, zero rate limits)
 	latestURL := fmt.Sprintf("https://github.com/%s/releases/latest", githubRepo)
-	req, err := http.NewRequest("HEAD", latestURL, nil)
+	req, err := http.NewRequest("GET", latestURL, nil)
 	if err == nil {
 		req.Header.Set("User-Agent", "sshhub-updater")
 		checkClient := &http.Client{
 			Timeout:   10 * time.Second,
-			Transport: client.Transport,
+			Transport: defaultTransport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		}
 		if resp, err := checkClient.Do(req); err == nil {
-			resp.Body.Close()
+			defer resp.Body.Close()
 			if loc := resp.Header.Get("Location"); loc != "" {
 				parts := strings.Split(loc, "/")
 				if len(parts) > 0 {
@@ -79,6 +84,7 @@ func FetchLatestVersion() (string, error) {
 
 	// 2. Fallback to GitHub API
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
+	client := newHTTPClient(10 * time.Second)
 	req, err = http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return "", err
@@ -131,67 +137,30 @@ func DownloadAndApplyHubUpdate(targetVersion string) error {
 
 	client := newHTTPClient(3 * time.Minute)
 
-	// 1. Try GitHub API for direct asset download
-	var apiURL string
+	var downloadURL string
 	if tag != "" {
-		apiURL = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", githubRepo, tag)
+		downloadURL = fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", githubRepo, tag, assetName)
 	} else {
-		apiURL = fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
+		downloadURL = fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", githubRepo, assetName)
 	}
 
-	var body io.ReadCloser
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err == nil {
-		req.Header.Set("User-Agent", "sshhub-updater")
-		if resp, err := client.Do(req); err == nil && resp.StatusCode == http.StatusOK {
-			var rel githubRelease
-			if err := json.NewDecoder(resp.Body).Decode(&rel); err == nil {
-				for _, asset := range rel.Assets {
-					if asset.Name == assetName && asset.URL != "" {
-						assetReq, err := http.NewRequest("GET", asset.URL, nil)
-						if err == nil {
-							assetReq.Header.Set("Accept", "application/octet-stream")
-							assetReq.Header.Set("User-Agent", "sshhub-updater")
-							if assetResp, err := client.Do(assetReq); err == nil && assetResp.StatusCode == http.StatusOK {
-								body = assetResp.Body
-								log.Printf("hub: downloading update via GitHub API (%s)...", asset.Name)
-								break
-							}
-						}
-					}
-				}
-			}
-			resp.Body.Close()
-		}
+	log.Printf("hub: downloading update from %s...", downloadURL)
+	req, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "sshhub-updater")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch %s: %w", downloadURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("github HTTP %d for %s", resp.StatusCode, downloadURL)
 	}
 
-	// 2. Fallback to direct browser download URL
-	if body == nil {
-		var downloadURL string
-		if tag != "" {
-			downloadURL = fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", githubRepo, tag, assetName)
-		} else {
-			downloadURL = fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", githubRepo, assetName)
-		}
-		log.Printf("hub: downloading update from %s...", downloadURL)
-		req, err := http.NewRequest("GET", downloadURL, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("User-Agent", "sshhub-updater")
-		resp, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("fetch %s: %w", downloadURL, err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return fmt.Errorf("github HTTP %d for %s", resp.StatusCode, downloadURL)
-		}
-		body = resp.Body
-	}
-	defer body.Close()
-
-	gzReader, err := gzip.NewReader(body)
+	gzReader, err := gzip.NewReader(resp.Body)
 	if err != nil {
 		return fmt.Errorf("read gzip: %w", err)
 	}
