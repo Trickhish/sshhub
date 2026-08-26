@@ -3,6 +3,7 @@ package control
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -18,22 +19,27 @@ import (
 
 const githubRepo = "Trickhish/sshhub"
 
+type githubRelease struct {
+	TagName string        `json:"tag_name"`
+	Assets  []githubAsset `json:"assets"`
+}
+
+type githubAsset struct {
+	Name               string `json:"name"`
+	URL                string `json:"url"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
 // DownloadAndApplyGitHubUpdate downloads the latest release binary directly from GitHub
 // over verified HTTPS, atomically replaces the local executable, and restarts the service.
 func DownloadAndApplyGitHubUpdate(targetVersion string) error {
 	arch := runtime.GOARCH
 	goos := runtime.GOOS
-
 	assetName := fmt.Sprintf("sshhub-agent-%s-%s.tar.gz", goos, arch)
-	var downloadURL string
-	if targetVersion != "" && !strings.HasPrefix(targetVersion, "0.0") {
-		tag := targetVersion
-		if !strings.HasPrefix(tag, "v") {
-			tag = "v" + tag
-		}
-		downloadURL = fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", githubRepo, tag, assetName)
-	} else {
-		downloadURL = fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", githubRepo, assetName)
+
+	tag := targetVersion
+	if tag != "" && !strings.HasPrefix(tag, "v") {
+		tag = "v" + tag
 	}
 
 	execPath, err := os.Executable()
@@ -56,31 +62,75 @@ func DownloadAndApplyGitHubUpdate(targetVersion string) error {
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
-	log.Printf("agent: downloading update from GitHub (%s)...", downloadURL)
-
 	client := &http.Client{Timeout: 3 * time.Minute}
-	resp, err := client.Get(downloadURL)
+
+	// 1. Try fetching release asset metadata via GitHub API first
+	var apiURL string
+	if tag != "" {
+		apiURL = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", githubRepo, tag)
+	} else {
+		apiURL = fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
+	}
+
+	var body io.ReadCloser
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "sshhub-agent-updater")
+		if resp, err := client.Do(req); err == nil && resp.StatusCode == http.StatusOK {
+			var rel githubRelease
+			if err := json.NewDecoder(resp.Body).Decode(&rel); err == nil {
+				for _, asset := range rel.Assets {
+					if asset.Name == assetName && asset.URL != "" {
+						assetReq, err := http.NewRequest("GET", asset.URL, nil)
+						if err == nil {
+							assetReq.Header.Set("Accept", "application/octet-stream")
+							assetReq.Header.Set("User-Agent", "sshhub-agent-updater")
+							if assetResp, err := client.Do(assetReq); err == nil && assetResp.StatusCode == http.StatusOK {
+								body = assetResp.Body
+								log.Printf("agent: downloading update via GitHub API (%s)...", asset.Name)
+								break
+							}
+						}
+					}
+				}
+			}
+			resp.Body.Close()
+		}
+	}
+
+	// 2. Fallback to direct browser download URL
+	if body == nil {
+		var downloadURL string
+		if tag != "" {
+			downloadURL = fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", githubRepo, tag, assetName)
+		} else {
+			downloadURL = fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", githubRepo, assetName)
+		}
+		log.Printf("agent: downloading update from %s...", downloadURL)
+		req, err := http.NewRequest("GET", downloadURL, nil)
+		if err != nil {
+			tmpFile.Close()
+			return err
+		}
+		req.Header.Set("User-Agent", "sshhub-agent-updater")
+		resp, err := client.Do(req)
+		if err != nil {
+			tmpFile.Close()
+			return fmt.Errorf("fetch %s: %w", downloadURL, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			tmpFile.Close()
+			return fmt.Errorf("github HTTP %d for %s", resp.StatusCode, downloadURL)
+		}
+		body = resp.Body
+	}
+	defer body.Close()
+
+	gzReader, err := gzip.NewReader(body)
 	if err != nil {
 		tmpFile.Close()
-		return fmt.Errorf("fetch %s: %w", downloadURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		tmpFile.Close()
-		rawBinaryURL := fmt.Sprintf("https://github.com/%s/releases/latest/download/sshhub-agent-%s-%s", githubRepo, goos, arch)
-		return downloadRawBinary(rawBinaryURL, tmpPath, execPath)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		tmpFile.Close()
-		return fmt.Errorf("github returned HTTP %d for %s", resp.StatusCode, downloadURL)
-	}
-
-	gzReader, err := gzip.NewReader(resp.Body)
-	if err != nil {
-		tmpFile.Close()
-		return downloadRawBinary(downloadURL, tmpPath, execPath)
+		return fmt.Errorf("read gzip: %w", err)
 	}
 	defer gzReader.Close()
 
@@ -108,32 +158,7 @@ func DownloadAndApplyGitHubUpdate(targetVersion string) error {
 	tmpFile.Close()
 
 	if !found {
-		return fmt.Errorf("sshhub-agent binary not found in GitHub release archive")
-	}
-
-	return installAndRestart(tmpPath, execPath)
-}
-
-func downloadRawBinary(url, tmpPath, execPath string) error {
-	client := &http.Client{Timeout: 3 * time.Minute}
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("download binary: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("github HTTP %d for %s", resp.StatusCode, url)
-	}
-
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(f, resp.Body)
-	f.Close()
-	if err != nil {
-		return err
+		return fmt.Errorf("sshhub-agent binary not found in release archive")
 	}
 
 	return installAndRestart(tmpPath, execPath)
