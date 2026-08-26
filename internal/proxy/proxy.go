@@ -454,10 +454,17 @@ func (s *Server) resolveBackendAndUser(loginUser, hint string) (string, string) 
 		}
 	}
 
+	// 1. Check if login username directly matches a backend ID (e.g. ssh cidev@hub)
 	if b := s.cfg.BackendByID(req.Username); b != nil {
 		return b.ID, s.effectiveBackendUser(b.ID, "")
 	}
 
+	// 2. Check if login username matches a hostname route (e.g. ssh nuc@hub -> matches hostname: nuc)
+	if id, ok := s.router.Resolve(routing.Request{Username: "*", Hostname: req.Username}); ok {
+		return id, s.effectiveBackendUser(id, "")
+	}
+
+	// 3. Check regular user routes / catch-all
 	if id, ok := s.router.Resolve(req); ok {
 		return id, s.effectiveBackendUser(id, req.Username)
 	}
