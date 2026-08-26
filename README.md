@@ -46,11 +46,29 @@ It supports two operating models:
                     └────────────────┘      └─────────────────┘
 ```
 
+## Security & Zero-Trust Model
+
+SSHub is designed with defense-in-depth and zero-trust principles:
+
+### 1. End-to-End Cryptography (ProxyJump Mode)
+When using ProxyJump (`ssh -J hub.example.com worker1`):
+- The central Hub operates as a **blind Layer 4 TCP proxy**.
+- Diffie-Hellman Key Exchange and public key authentication happen **end-to-end** directly between your local client and the backend server.
+- **Even if the central Hub is fully compromised**, an attacker cannot decrypt sessions, inject commands, or compromise backend nodes.
+
+### 2. Cryptographically Signed Auto-Updates (Ed25519)
+- `sshhub-agent` automatically updates itself over the reverse control port when new versions are deployed to the Hub.
+- **Supply Chain Protection**: Every binary update is cryptographically signed using an offline **Developer Ed25519 Private Key**.
+- `sshhub-agent` has the corresponding Developer Public Key hardcoded in its binary and **strictly verifies the cryptographic signature** before executing or installing any update.
+- **The Private Signing Key NEVER lives on the Hub**: The Hub only stores and distributes pre-signed `.sig` artifacts. Even if an attacker gains root on the Hub and replaces the binary, connected agents will detect the invalid signature, abort the update, and stay secure.
+
+---
+
 ## Features
 
 - **Zero-Config Direct SSH:** Access private backends using `ssh backend@hub` or `ssh user@backend@hub`.
 - **CLI Management (`sshhub-ctl`):** Easily add or remove backend nodes with auto-generated secure tokens.
-- **1-Line Installers & Auto-Updates:** Quick automated setup and seamless in-band automatic binary updates over the control port.
+- **1-Line Installers & Signed Auto-Updates:** Quick automated setup and cryptographically verified in-band updates over the control port.
 - **Token-Identified Backends:** Each backend is bound to its unique secret token. Agents do not need to manage or pass their own ID.
 - **Node-Level Key Authorization:** The endpoint `sshhub-agent` verifies the user's public key against local `/root/.ssh/authorized_keys`.
 - **Embedded PTY Management:** Native pseudo-terminal allocation with dynamic window resize (`SIGWINCH`), interactive shells, and command execution.
@@ -102,7 +120,7 @@ ssh worker1
 Generates a secure cryptographic token, registers the backend and its route in `/etc/sshhub/sshhub.yaml`, reloads the service, and outputs the ready-to-run 1-line install command:
 
 ```sh
-sshhub-ctl add worker1 --hub hub.example.com:7000
+sshhub-ctl add worker1
 ```
 
 Output:
@@ -113,14 +131,14 @@ Generated Token:
   AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k
 
 1-Line Agent Install Command (run on node "worker1"):
-  curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub hub.example.com:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
+  curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub cdn.srv.dury.dev:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
 
 Manual binary command:
-  sshhub-agent --hub hub.example.com:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
+  sshhub-agent --hub cdn.srv.dury.dev:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k"
 
 To connect from your client:
-  ssh worker1@hub.example.com
-  ssh root@worker1@hub.example.com
+  ssh worker1@cdn.srv.dury.dev
+  ssh root@worker1@cdn.srv.dury.dev
 ```
 
 ### Listing backends
@@ -173,6 +191,23 @@ routes:
     backend: worker1
 ```
 
+## Developer: Signing Releases
+
+When compiling a new `sshhub-agent` binary for distribution, sign it on your **local developer machine** using your private key:
+
+```sh
+# 1. Build new agent
+go build -o sshhub-agent ./cmd/sshhub-agent
+
+# 2. Sign binary (generates sshhub-agent.sig)
+./scripts/sign-binary.sh ./sshhub-agent /path/to/release.priv
+
+# 3. Upload binary and signature to the Hub
+scp sshhub-agent sshhub-agent.sig hub:/usr/local/bin/
+```
+
+Connected agents will automatically download, verify the Ed25519 signature against their embedded public key, and upgrade seamlessly.
+
 ## Building
 
 Requires Go 1.22+.
@@ -191,6 +226,8 @@ The hub is configured with `/etc/sshhub/sshhub.yaml`:
 listen:
   ssh: ":22"        # where SSH clients connect
   control: ":7000"  # where agents connect (reverse mode)
+
+public_host: "hub.example.com" # public domain used in ctl output
 
 host_key: "/etc/sshhub/ssh_host_ed25519_key"
 
