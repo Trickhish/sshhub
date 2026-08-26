@@ -2,6 +2,8 @@
 
 ### Quick 1-Line Install
 
+By default, the installer downloads the latest pre-compiled stable release from GitHub (instant install, no Go compiler required).
+
 **1. Install Gateway Server (on your public VPS / Hub):**
 ```sh
 curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-server.sh | sudo bash
@@ -13,6 +15,28 @@ curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/instal
 ```
 
 *(Run `sshhub-ctl add <backend-id>` on your Hub to auto-generate the token and the exact copy-paste agent install command).*
+
+#### Installer Options
+
+Both install scripts accept optional arguments:
+
+| Option | Description |
+| :--- | :--- |
+| `--rebuild` (or `--build`) | Force compilation from Git source using Go instead of downloading pre-built GitHub release binaries |
+| `--version <vX.Y.Z>` | Install a specific release version (defaults to latest stable release) |
+| `--hub <host:port>` | Hub control listener address (agent installer) |
+| `--token <token>` | Backend authentication token (agent installer) |
+| `--ssh-port <port>` | SSH listener port (server installer, default `:22`) |
+| `--control-port <port>` | Control plane port (server installer, default `:7000`) |
+
+**Example (Force rebuild from source):**
+```sh
+# Build agent from source:
+curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --rebuild
+
+# Build server from source:
+curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-server.sh | sudo bash -s -- --rebuild
+```
 
 ---
 
@@ -190,7 +214,9 @@ routes:
     backend: worker1
 ```
 
-## Building
+## Manual Building from Source
+
+If you prefer building manually rather than using the installer scripts:
 
 Requires Go 1.22+.
 
