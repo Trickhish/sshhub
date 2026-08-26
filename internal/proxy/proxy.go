@@ -1,9 +1,12 @@
-// Package proxy implements transparent Layer-4 SSH passthrough between clients and backends.
+// Package proxy implements transparent SSH routing between clients and backends.
 //
-// Clients connect using standard ProxyJump (-J), ProxyCommand (-W), or ~/.ssh/config.
-// SSHub transparently bridges the direct-tcpip channel to the target backend (either via
-// direct TCP dial or reverse yamux multiplexed tunnel). The client and backend perform
-// end-to-end Diffie-Hellman key exchange and authentication directly.
+// Clients can connect directly using standard SSH commands (e.g. ssh -p 2222 cidev@hub
+// or ssh -p 2222 root@cidev@hub) with full interactive shells, PTYs, exec, and signals,
+// or connect via ProxyJump (-J) / direct-tcpip.
+//
+// In direct session mode, the hub delegates authentication to the backend agent, which
+// checks the connecting client's actual public key against the local authorized_keys file
+// before spawning a PTY or shell. The hub has no credentials of its own.
 package proxy
 
 import (
@@ -22,7 +25,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Server routes SSH clients to backends in pure passthrough mode.
+// Server routes SSH clients to backends.
 type Server struct {
 	cfg       *config.Config
 	registry  *control.Registry
@@ -30,7 +33,7 @@ type Server struct {
 	sshConfig *ssh.ServerConfig
 }
 
-// New builds a passthrough proxy Server from the hub configuration.
+// New builds a proxy Server from the hub configuration.
 func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 	hostKey, err := loadHostKey(cfg.HostKey)
 	if err != nil {
@@ -38,7 +41,22 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 	}
 
 	sshConfig := &ssh.ServerConfig{
-		NoClientAuth: true,
+		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					"user":   conn.User(),
+					"pubkey": string(ssh.MarshalAuthorizedKey(key)),
+				},
+			}, nil
+		},
+		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					"user":     conn.User(),
+					"password": string(password),
+				},
+			}, nil
+		},
 	}
 
 	if cfg.AuthorizedKeys != "" {
@@ -46,10 +64,14 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
-		sshConfig.NoClientAuth = false
 		sshConfig.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if _, ok := keys[string(key.Marshal())]; ok {
-				return &ssh.Permissions{Extensions: map[string]string{"user": conn.User()}}, nil
+				return &ssh.Permissions{
+					Extensions: map[string]string{
+						"user":   conn.User(),
+						"pubkey": string(ssh.MarshalAuthorizedKey(key)),
+					},
+				}, nil
 			}
 			return nil, fmt.Errorf("unknown public key")
 		}
@@ -111,13 +133,15 @@ func (s *Server) Handle(conn net.Conn) {
 	}
 }
 
-// handleChannel processes incoming channels.
+// handleChannel processes channel requests (direct-tcpip or session).
 func (s *Server) handleChannel(serverConn *ssh.ServerConn, newCh ssh.NewChannel) {
 	switch newCh.ChannelType() {
 	case "direct-tcpip":
 		s.handleDirectTCPIP(serverConn, newCh)
+	case "session":
+		s.handleSession(serverConn, newCh)
 	default:
-		newCh.Reject(ssh.Prohibited, "sshhub operates in passthrough mode; please connect using ProxyJump: ssh -J <hub> <user@backend>")
+		newCh.Reject(ssh.UnknownChannelType, fmt.Sprintf("unsupported channel type: %s", newCh.ChannelType()))
 	}
 }
 
@@ -135,7 +159,7 @@ func (s *Server) handleDirectTCPIP(serverConn *ssh.ServerConn, newCh ssh.NewChan
 		return
 	}
 
-	backendID := s.resolveBackend(serverConn.User(), payload.DestAddr)
+	backendID, _ := s.resolveBackendAndUser(serverConn.User(), payload.DestAddr)
 	if backendID == "" {
 		log.Printf("ssh: direct-tcpip: no route for user %q dest %q", serverConn.User(), payload.DestAddr)
 		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("no route to host %s", payload.DestAddr))
@@ -167,7 +191,180 @@ func (s *Server) handleDirectTCPIP(serverConn *ssh.ServerConn, newCh ssh.NewChan
 	bridge(ch, backendConn)
 }
 
-func (s *Server) resolveBackend(loginUser, hint string) string {
+func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel) {
+	backendID, targetUser := s.resolveBackendAndUser(serverConn.User(), "")
+	if backendID == "" {
+		log.Printf("ssh: no route for user %q", serverConn.User())
+		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("sshhub: no route for user %q", serverConn.User()))
+		return
+	}
+
+	backend := s.cfg.BackendByID(backendID)
+	if backend == nil {
+		log.Printf("ssh: backend %q not found", backendID)
+		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("sshhub: backend %q not found", backendID))
+		return
+	}
+
+	// Dial the backend agent and pass the client's verified public key for authorization
+	backendConn, backendChans, backendReqs, err := s.dialBackendAgent(backend, targetUser, serverConn.Permissions)
+	if err != nil {
+		log.Printf("ssh: backend %q auth failed for user %q: %v", backendID, targetUser, err)
+		newCh.Reject(ssh.Prohibited, fmt.Sprintf("Permission denied (publickey) on backend %s", backendID))
+		return
+	}
+	defer backendConn.Close()
+
+	go ssh.DiscardRequests(backendReqs)
+
+	backendCh, breqs, err := backendConn.OpenChannel("session", newCh.ExtraData())
+	if err != nil {
+		log.Printf("ssh: backend %q open session: %v", backendID, err)
+		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("backend %q open session: %v", backendID, err))
+		return
+	}
+	defer backendCh.Close()
+
+	clientCh, clientReqs, err := newCh.Accept()
+	if err != nil {
+		return
+	}
+	defer clientCh.Close()
+
+	log.Printf("ssh: session %s -> backend %q (user %q)", serverConn.RemoteAddr(), backendID, targetUser)
+
+	// Forward client requests to backend (pty-req, shell, exec, window-change, env, subsystem, etc.)
+	go func() {
+		for req := range clientReqs {
+			ok, err := backendCh.SendRequest(req.Type, req.WantReply, req.Payload)
+			if req.WantReply {
+				req.Reply(err == nil && ok, nil)
+			}
+		}
+	}()
+
+	// Forward backend requests to client (exit-status, exit-signal, etc.)
+	var breqsWg sync.WaitGroup
+	breqsWg.Add(1)
+	go func() {
+		defer breqsWg.Done()
+		for req := range breqs {
+			ok, err := clientCh.SendRequest(req.Type, req.WantReply, req.Payload)
+			if req.WantReply {
+				req.Reply(err == nil && ok, nil)
+			}
+		}
+	}()
+
+	// Forward any backend-initiated reverse channels
+	go func() {
+		for bNewCh := range backendChans {
+			forwardBackendChannel(bNewCh, serverConn)
+		}
+	}()
+
+	go func() {
+		io.Copy(backendCh, clientCh)
+		backendCh.CloseWrite()
+	}()
+
+	io.Copy(clientCh, backendCh)
+	clientCh.CloseWrite()
+	backendCh.Close()
+	breqsWg.Wait()
+	clientCh.Close()
+}
+
+func forwardBackendChannel(ch ssh.NewChannel, client *ssh.ServerConn) {
+	cch, creqs, err := client.OpenChannel(ch.ChannelType(), ch.ExtraData())
+	if err != nil {
+		ch.Reject(ssh.ConnectionFailed, fmt.Sprintf("client open channel: %v", err))
+		return
+	}
+
+	backendCh, backendReqs, err := ch.Accept()
+	if err != nil {
+		cch.Close()
+		return
+	}
+
+	go func() {
+		for req := range backendReqs {
+			ok, err := cch.SendRequest(req.Type, req.WantReply, req.Payload)
+			if req.WantReply {
+				req.Reply(err == nil && ok, nil)
+			}
+		}
+	}()
+
+	var creqsWg sync.WaitGroup
+	creqsWg.Add(1)
+	go func() {
+		defer creqsWg.Done()
+		for req := range creqs {
+			ok, err := backendCh.SendRequest(req.Type, req.WantReply, req.Payload)
+			if req.WantReply {
+				req.Reply(err == nil && ok, nil)
+			}
+		}
+	}()
+
+	go func() {
+		io.Copy(backendCh, cch)
+		backendCh.CloseWrite()
+	}()
+
+	io.Copy(cch, backendCh)
+	cch.CloseWrite()
+	backendCh.Close()
+	creqsWg.Wait()
+	cch.Close()
+}
+
+// dialBackend opens a raw network stream to the backend.
+func (s *Server) dialBackend(backend *config.Backend) (net.Conn, error) {
+	if backend.Mode == "reverse" {
+		return s.registry.Open(context.Background(), backend.ID)
+	}
+	return net.Dial("tcp", backend.Address)
+}
+
+// dialBackendAgent opens a connection to the backend agent and passes the client's public key / password for authorization.
+func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, perms *ssh.Permissions) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+	rawConn, err := s.dialBackend(backend)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	user := targetUser
+	if user == "" {
+		user = backend.Username
+	}
+	if user == "" {
+		user = "root"
+	}
+
+	var auth []ssh.AuthMethod
+	if perms != nil && perms.Extensions != nil {
+		if pubkey := perms.Extensions["pubkey"]; pubkey != "" {
+			auth = append(auth, ssh.Password(pubkey))
+		} else if password := perms.Extensions["password"]; password != "" {
+			auth = append(auth, ssh.Password(password))
+		}
+	}
+
+	clientConfig := &ssh.ClientConfig{
+		User:            user,
+		Auth:            auth,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	return ssh.NewClientConn(rawConn, backend.ID, clientConfig)
+}
+
+// resolveBackendAndUser extracts the target backend ID and the backend username from
+// the client's login username and/or extra hint (such as direct-tcpip DestAddr).
+func (s *Server) resolveBackendAndUser(loginUser, hint string) (string, string) {
 	req := routing.ParseRequest(loginUser)
 	hint = strings.TrimSpace(hint)
 
@@ -188,44 +385,47 @@ func (s *Server) resolveBackend(loginUser, hint string) string {
 		}
 
 		if id, ok := s.router.Resolve(req); ok {
-			return id
+			return id, s.effectiveBackendUser(id, req.Username)
 		}
 
 		if id, ok := s.router.Resolve(routing.Request{Username: "*", Hostname: host}); ok {
-			return id
+			return id, s.effectiveBackendUser(id, req.Username)
 		}
 
 		if b := s.cfg.BackendByID(host); b != nil {
-			return b.ID
+			return b.ID, s.effectiveBackendUser(b.ID, req.Username)
 		}
 	}
 
 	if req.Hostname != "" {
 		if id, ok := s.router.Resolve(req); ok {
-			return id
+			return id, s.effectiveBackendUser(id, req.Username)
 		}
 		if b := s.cfg.BackendByID(req.Hostname); b != nil {
-			return b.ID
+			return b.ID, s.effectiveBackendUser(b.ID, req.Username)
 		}
 	}
 
 	if b := s.cfg.BackendByID(req.Username); b != nil {
-		return b.ID
+		return b.ID, s.effectiveBackendUser(b.ID, "")
 	}
 
 	if id, ok := s.router.Resolve(req); ok {
-		return id
+		return id, s.effectiveBackendUser(id, req.Username)
 	}
 
-	return ""
+	return "", ""
 }
 
-// dialBackend opens a raw network stream to the backend.
-func (s *Server) dialBackend(backend *config.Backend) (net.Conn, error) {
-	if backend.Mode == "reverse" {
-		return s.registry.Open(context.Background(), backend.ID)
+func (s *Server) effectiveBackendUser(backendID, clientUser string) string {
+	b := s.cfg.BackendByID(backendID)
+	if b != nil && b.Username != "" {
+		return b.Username
 	}
-	return net.Dial("tcp", backend.Address)
+	if clientUser != "" && clientUser != "*" {
+		return clientUser
+	}
+	return "root"
 }
 
 // bridge copies bytes bidirectionally between two streams.

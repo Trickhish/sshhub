@@ -1,27 +1,26 @@
 # sshhub
 
-SSHub is an SSH gateway that acts as a single entry point and transparently
-routes incoming SSH connections to backend servers using **pure Layer-4 passthrough**.
+SSHub is an SSH gateway and reverse access platform that provides a single entry
+point for accessing private servers behind NATs and firewalls.
 
-SSHub relays the raw, end-to-end encrypted SSH stream between the client and the
-backend `sshd`. Client credentials, public keys, and host keys are negotiated
-directly between the client and the backend server without the hub terminating
-or impersonating authentication.
+It supports two operating models:
 
-SSHub supports two transport models so it fits both classic and NAT/firewall
-restricted topologies:
+1. **Direct 1-Command SSH Access (Zero Client Config)**:
+   - Connect straight with `ssh -p 2222 cidev@cdn.srv.dury.dev` or `ssh -p 2222 root@cidev@cdn.srv.dury.dev`.
+   - The Hub routes the session to `sshhub-agent` on the backend node.
+   - `sshhub-agent` validates the client's public key against local `/root/.ssh/authorized_keys`, allocates a native PTY, and launches the shell.
+   - The Hub stores **zero credentials or backdoor keys**.
 
-- **Direct mode** — the central server dials backend SSH servers directly.
-- **Reverse mode** — backend servers establish an outbound control connection
-  to the central server, so backends behind NATs or strict firewalls can still
-  be reached without opening inbound ports.
+2. **Layer-4 ProxyJump Passthrough**:
+   - `ssh -J cdn.srv.dury.dev:2222 root@cidev`
+   - Bridges raw `direct-tcpip` streams directly to an existing OpenSSH daemon.
 
 ```
                           ┌────────────────────────────┐
                           │        sshhub (hub)        │
                           │                            │
-   ssh -J hub backend ───▶│  :2222 SSH listener       │
-                          │  :7000 control listener   │
+   ssh -p 2222 cidev@hub ─▶│  :2222 SSH listener       │
+   ssh -J hub backend   ──▶│  :7000 control listener   │
                           └───────┬────────────┬───────┘
                           direct  │            │ reverse
                           dial    │            │ (agents dial in)
@@ -33,53 +32,49 @@ restricted topologies:
 
 ## Features
 
-- **End-to-End Cryptographic Passthrough:** Client authenticates directly against the backend `sshd` with the client's own key or password. The hub never stores or impersonates backend credentials.
-- **Zero-Knowledge Gateway:** The hub only sees encrypted traffic and bridges `direct-tcpip` channels.
-- **Dynamic Routing:** Route SSH connections by hostname, username, or glob patterns.
-- **Direct & Reverse Transports:** Direct TCP connections for public servers and yamux multiplexed reverse tunnels for hosts behind NAT.
-- **Single Static Binaries:** Zero dependencies for `sshhub` gateway and `sshhub-agent`.
+- **Zero-Config Direct SSH:** Access private backends using `ssh -p 2222 backend@hub` or `ssh -p 2222 user@backend@hub`.
+- **Node-Level Key Authorization:** The endpoint `sshhub-agent` verifies the user's public key against local `/root/.ssh/authorized_keys`.
+- **Embedded PTY Management:** Native pseudo-terminal allocation with dynamic window resize (`SIGWINCH`), interactive shells, and command execution.
+- **No Inbound Open Ports Required:** Backend nodes establish outbound reverse yamux tunnels to the hub.
+- **No OpenSSH `sshd` Needed:** Endpoints can run purely with `sshhub-agent`.
+- **ProxyJump Compatible:** Also works with standard `ssh -J` and `ssh -W`.
 
 ## Connecting
 
-### 1. Using ProxyJump (`-J`)
+### 1. Direct SSH (No Client Config)
+
+```sh
+# Login directly to backend "cidev" as root
+ssh -p 2222 cidev@cdn.srv.dury.dev
+
+# Specify a custom remote user with user@backend
+ssh -p 2222 root@cidev@cdn.srv.dury.dev
+ssh -p 2222 alice@web1@cdn.srv.dury.dev
+
+# Run non-interactive commands
+ssh -p 2222 cidev@cdn.srv.dury.dev "hostname -f && uptime"
+```
+
+### 2. Using ProxyJump (`-J`)
 
 ```sh
 ssh -J cdn.srv.dury.dev:2222 root@cidev
 ```
 
-### 2. Using `~/.ssh/config` (Simple 1-Command Access)
-
-Add this block to your local machine's `~/.ssh/config`:
+### 3. Using `~/.ssh/config`
 
 ```sshconfig
-Host *.hub cidev web1
-  ProxyJump cdn.srv.dury.dev:2222
+Host cidev
+  HostName cdn.srv.dury.dev
+  Port 2222
+  User cidev
 ```
 
-Once configured, you can connect directly with no extra flags:
+Then simply connect:
 
 ```sh
-ssh root@cidev
+ssh cidev
 ```
-
-### 3. Using ProxyCommand (`-W`)
-
-```sh
-ssh -o ProxyCommand="ssh -p 2222 -W %h:%p cdn.srv.dury.dev" root@cidev
-```
-
-## Routing
-
-Routing rules are evaluated top to bottom; the first match wins. A rule can
-match on any combination of:
-
-| Field      | Meaning                                          | Example value      |
-| ---------- | ------------------------------------------------ | ------------------ |
-| `username` | SSH username from the client                     | `alice`            |
-| `hostname` | Target hostname after `@` (e.g. `root@cidev`)    | `cidev`            |
-| `backend`  | Target backend to forward the connection to      | `cidev`            |
-
-Wildcards (`*`) are supported in both `username` and `hostname`.
 
 ## Building
 
@@ -92,59 +87,44 @@ go build -o sshhub-agent ./cmd/sshhub-agent
 
 ## Configuration
 
-The hub is configured with a single YAML file (`/etc/sshhub/sshhub.yaml`):
+The hub is configured with `/etc/sshhub/sshhub.yaml`:
 
 ```yaml
 listen:
   ssh: ":2222"      # where SSH clients connect
   control: ":7000"  # where agents connect (reverse mode)
 
-# The hub's SSH host key.
 host_key: "/etc/sshhub/ssh_host_ed25519_key"
 
-# (Optional) Public keys allowed to connect to the hub.
-# If omitted, any client can open passthrough tunnels to configured backends.
-authorized_keys: "/etc/sshhub/authorized_keys"
-
-# Tokens agents must present when connecting to the control plane.
 control_tokens:
-  - "change-me-agent-secret"
+  - "sshhub-token-secret-2026"
 
 backends:
-  - id: web1
-    mode: direct                 # hub dials this server directly
-    address: "10.0.0.10:22"
-
   - id: cidev
-    mode: reverse                # server dials the hub via sshhub-agent
+    mode: reverse
 
 routes:
   - match:
-      hostname: "web1"
-    backend: web1
-
-  - match:
       hostname: "cidev"
     backend: cidev
-
-  # default fallback
   - match:
       username: "*"
     backend: cidev
 ```
 
-### Running the hub
-
-```sh
-sshhub --config /etc/sshhub/sshhub.yaml
-```
-
 ### Running an agent (reverse mode)
 
 ```sh
+# Native PTY execution mode (default, no sshd needed)
 sshhub-agent \
   --hub cdn.srv.dury.dev:7000 \
-  --token change-me-agent-secret \
+  --token sshhub-token-secret-2026 \
+  --backend cidev
+
+# Or optional bridge mode to an existing local sshd daemon
+sshhub-agent \
+  --hub cdn.srv.dury.dev:7000 \
+  --token sshhub-token-secret-2026 \
   --backend cidev \
   --sshd 127.0.0.1:22
 ```

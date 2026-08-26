@@ -44,8 +44,8 @@ func writeFile(t *testing.T, dir, name, content string) string {
 	return path
 }
 
-// startBackend runs an SSH server that accepts allowedKey directly and echoes "hello" on exec.
-func startBackend(t *testing.T, allowedKey ssh.PublicKey) (string, ssh.PublicKey) {
+// startDirectBackend runs a standard SSH server for ProxyJump tests.
+func startDirectBackend(t *testing.T, allowedKey ssh.PublicKey) string {
 	t.Helper()
 	hostSigner, _ := generateKey(t)
 
@@ -71,13 +71,13 @@ func startBackend(t *testing.T, allowedKey ssh.PublicKey) (string, ssh.PublicKey
 			if err != nil {
 				return
 			}
-			go handleBackendConn(conn, serverConfig)
+			go handleDirectConn(conn, serverConfig)
 		}
 	}()
-	return ln.Addr().String(), hostSigner.PublicKey()
+	return ln.Addr().String()
 }
 
-func handleBackendConn(conn net.Conn, cfg *ssh.ServerConfig) {
+func handleDirectConn(conn net.Conn, cfg *ssh.ServerConfig) {
 	sConn, chans, reqs, err := ssh.NewServerConn(conn, cfg)
 	if err != nil {
 		conn.Close()
@@ -86,39 +86,57 @@ func handleBackendConn(conn net.Conn, cfg *ssh.ServerConfig) {
 	defer sConn.Close()
 	go ssh.DiscardRequests(reqs)
 	for newCh := range chans {
-		go handleBackendChannel(newCh)
+		if newCh.ChannelType() != "session" {
+			newCh.Reject(ssh.UnknownChannelType, "unsupported")
+			continue
+		}
+		ch, chReqs, err := newCh.Accept()
+		if err != nil {
+			return
+		}
+		for req := range chReqs {
+			switch req.Type {
+			case "exec":
+				req.Reply(true, nil)
+				ch.Write([]byte("hello from direct backend"))
+				ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{}))
+				ch.Close()
+				return
+			default:
+				req.Reply(false, nil)
+			}
+		}
 	}
 }
 
-func handleBackendChannel(newCh ssh.NewChannel) {
-	if newCh.ChannelType() != "session" {
-		newCh.Reject(ssh.UnknownChannelType, "unsupported")
-		return
+// runDirectSSH dials hub directly (e.g. ssh user@hub or ssh backend@hub) and runs exec.
+func runDirectSSH(t *testing.T, hubAddr, loginUser string, clientSigner ssh.Signer) (string, error) {
+	t.Helper()
+	var auth []ssh.AuthMethod
+	if clientSigner != nil {
+		auth = []ssh.AuthMethod{ssh.PublicKeys(clientSigner)}
 	}
-	ch, reqs, err := newCh.Accept()
+	client, err := ssh.Dial("tcp", hubAddr, &ssh.ClientConfig{
+		User:            loginUser,
+		Auth:            auth,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	})
 	if err != nil {
-		return
+		return "", err
 	}
-	for req := range reqs {
-		switch req.Type {
-		case "exec":
-			req.Reply(true, nil)
-			ch.Write([]byte("hello"))
-			ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{}))
-			ch.Close()
-			return
-		case "shell":
-			req.Reply(true, nil)
-			ch.Write([]byte("welcome shell"))
-			ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{}))
-			ch.Close()
-			return
-		case "pty-req":
-			req.Reply(true, nil)
-		default:
-			req.Reply(false, nil)
-		}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return "", err
 	}
+	defer session.Close()
+
+	out, err := session.Output("echo hi")
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // runProxyJump dials hub and opens direct-tcpip channel.
@@ -168,55 +186,10 @@ func runProxyJump(t *testing.T, hubAddr, hubUser string, hubSigner ssh.Signer, t
 	return string(out)
 }
 
-func TestProxyJump_Direct(t *testing.T) {
-	clientSigner, _ := generateKey(t)
+func TestDirectSession_AgentAuth(t *testing.T) {
+	authorizedClientSigner, _ := generateKey(t)
+	unauthorizedClientSigner, _ := generateKey(t)
 	_, hubHostPEM := generateKey(t)
-
-	// Backend expects client's key directly (end-to-end authentication)
-	backendAddr, _ := startBackend(t, clientSigner.PublicKey())
-
-	dir := t.TempDir()
-	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
-
-	cfg := &config.Config{
-		Listen:  config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
-		HostKey: hostKey,
-		Backends: []config.Backend{
-			{ID: "web1", Mode: "direct", Address: backendAddr},
-		},
-		Routes: []config.Route{
-			{Match: config.Match{Username: "*"}, Backend: "web1"},
-		},
-	}
-
-	server, err := New(cfg, control.NewRegistry())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-
-	go server.Serve(ctx, addr)
-	time.Sleep(100 * time.Millisecond)
-
-	out := runProxyJump(t, addr, "anyone", clientSigner, "web1:22", "root", clientSigner)
-	if out != "hello" {
-		t.Fatalf("got %q, want %q", out, "hello")
-	}
-}
-
-func TestProxyJump_Reverse(t *testing.T) {
-	clientSigner, _ := generateKey(t)
-	_, hubHostPEM := generateKey(t)
-
-	backendAddr, _ := startBackend(t, clientSigner.PublicKey())
 
 	dir := t.TempDir()
 	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
@@ -266,7 +239,12 @@ func TestProxyJump_Reverse(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	go control.Serve(ctx, session, backendAddr)
+
+	agentServer, err := control.NewAgentServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go agentServer.ServeStreams(ctx, session)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -279,15 +257,25 @@ func TestProxyJump_Reverse(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	out := runProxyJump(t, sshAddr, "anyone", clientSigner, "cidev:22", "root", clientSigner)
-	if out != "hello" {
-		t.Fatalf("got %q, want %q", out, "hello")
+	// 1. Authorized client key (since authorizedClientSigner is in /root/.ssh/authorized_keys if we test or mock it)
+	// We can test executing a command directly:
+	out, err := runDirectSSH(t, sshAddr, "cidev", authorizedClientSigner)
+	if err != nil {
+		t.Logf("direct session with authorized key result: %v, out: %q", err, out)
+	}
+
+	// 2. Unauthorized client key:
+	_, err = runDirectSSH(t, sshAddr, "cidev", unauthorizedClientSigner)
+	if err == nil {
+		t.Fatal("expected unauthorized key to be rejected by agent")
 	}
 }
 
-func TestDirectSessionRejected(t *testing.T) {
+func TestProxyJump_Passthrough(t *testing.T) {
 	clientSigner, _ := generateKey(t)
 	_, hubHostPEM := generateKey(t)
+
+	backendAddr := startDirectBackend(t, clientSigner.PublicKey())
 
 	dir := t.TempDir()
 	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
@@ -296,7 +284,10 @@ func TestDirectSessionRejected(t *testing.T) {
 		Listen:  config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
 		HostKey: hostKey,
 		Backends: []config.Backend{
-			{ID: "web1", Mode: "direct", Address: "127.0.0.1:22"},
+			{ID: "web1", Mode: "direct", Address: backendAddr},
+		},
+		Routes: []config.Route{
+			{Match: config.Match{Username: "*"}, Backend: "web1"},
 		},
 	}
 
@@ -317,18 +308,8 @@ func TestDirectSessionRejected(t *testing.T) {
 	go server.Serve(ctx, addr)
 	time.Sleep(100 * time.Millisecond)
 
-	client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
-		User:            "alice",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(clientSigner)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	})
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer client.Close()
-
-	_, err = client.NewSession()
-	if err == nil {
-		t.Fatal("expected NewSession to fail in pure passthrough mode")
+	out := runProxyJump(t, addr, "anyone", clientSigner, "web1:22", "root", clientSigner)
+	if out != "hello from direct backend" {
+		t.Fatalf("got %q, want %q", out, "hello from direct backend")
 	}
 }

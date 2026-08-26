@@ -17,7 +17,7 @@ func main() {
 	hub := flag.String("hub", "", "hub control address (host:port)")
 	token := flag.String("token", "", "control plane token")
 	backend := flag.String("backend", "", "backend id to register")
-	sshd := flag.String("sshd", "127.0.0.1:22", "local sshd address to bridge to")
+	sshd := flag.String("sshd", "", "optional local sshd address to bridge to (if omitted, agent serves sessions natively)")
 	useTLS := flag.Bool("tls", false, "connect to the hub over TLS")
 	insecure := flag.Bool("tls-insecure-skip-verify", false, "skip TLS certificate verification")
 	flag.Parse()
@@ -48,7 +48,19 @@ func main() {
 		session.Close()
 	}()
 
-	if err := control.Serve(ctx, session, *sshd); err != nil {
-		log.Fatalf("serve: %v", err)
+	if *sshd != "" {
+		log.Printf("bridging reverse streams to local sshd %s", *sshd)
+		if err := control.Serve(ctx, session, *sshd); err != nil {
+			log.Fatalf("serve sshd bridge: %v", err)
+		}
+	} else {
+		log.Printf("serving native PTY sessions on agent")
+		agentServer, err := control.NewAgentServer()
+		if err != nil {
+			log.Fatalf("create agent server: %v", err)
+		}
+		if err := agentServer.ServeStreams(ctx, session); err != nil {
+			log.Fatalf("serve native sessions: %v", err)
+		}
 	}
 }
