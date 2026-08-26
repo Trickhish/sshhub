@@ -12,10 +12,10 @@ import (
 type Config struct {
 	Listen         Listen    `yaml:"listen"`
 	HostKey        string    `yaml:"host_key"`
-	AuthorizedKeys string    `yaml:"authorized_keys"`
-	TLSCert        string    `yaml:"tls_cert"`
-	TLSKey         string    `yaml:"tls_key"`
-	ControlTokens  []string  `yaml:"control_tokens"`
+	AuthorizedKeys string    `yaml:"authorized_keys,omitempty"`
+	TLSCert        string    `yaml:"tls_cert,omitempty"`
+	TLSKey         string    `yaml:"tls_key,omitempty"`
+	ControlTokens  []string  `yaml:"control_tokens,omitempty"`
 	Backends       []Backend `yaml:"backends"`
 	Routes         []Route   `yaml:"routes"`
 }
@@ -30,34 +30,88 @@ type Listen struct {
 type Backend struct {
 	ID          string `yaml:"id"`
 	Mode        string `yaml:"mode"` // "direct" or "reverse"
-	Token       string `yaml:"token"` // per-backend token for reverse mode
-	Address     string `yaml:"address"`
-	Username    string `yaml:"username"`
-	Auth        Auth   `yaml:"auth"`
-	HostKey     string `yaml:"host_key"`
-	HostKeyFile string `yaml:"host_key_file"`
+	Token       string `yaml:"token,omitempty"` // per-backend token for reverse mode
+	Address     string `yaml:"address,omitempty"`
+	Username    string `yaml:"username,omitempty"`
+	Auth        *Auth  `yaml:"auth,omitempty"`
+	HostKey     string `yaml:"host_key,omitempty"`
+	HostKeyFile string `yaml:"host_key_file,omitempty"`
 }
 
 // Auth holds the credentials the hub uses to authenticate to a backend.
 type Auth struct {
-	PrivateKey string `yaml:"private_key"`
-	Password   string `yaml:"password"`
+	PrivateKey string `yaml:"private_key,omitempty"`
+	Password   string `yaml:"password,omitempty"`
 }
 
 // Route maps a matching request to a backend.
 // Supports both flat route syntax (hostname, username, backend)
 // and nested match blocks (match: { hostname, username }, backend).
 type Route struct {
-	Match    Match  `yaml:"match"`
+	Match    Match  `yaml:"-"`
 	Backend  string `yaml:"backend"`
-	Username string `yaml:"username"`
-	Hostname string `yaml:"hostname"`
+	Username string `yaml:"username,omitempty"`
+	Hostname string `yaml:"hostname,omitempty"`
+}
+
+// UnmarshalYAML decodes a route supporting both flat and nested match syntax.
+func (r *Route) UnmarshalYAML(value *yaml.Node) error {
+	type rawRoute struct {
+		Match    Match  `yaml:"match"`
+		Backend  string `yaml:"backend"`
+		Username string `yaml:"username"`
+		Hostname string `yaml:"hostname"`
+	}
+	var raw rawRoute
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	r.Backend = raw.Backend
+	r.Username = raw.Username
+	r.Hostname = raw.Hostname
+	r.Match = raw.Match
+
+	if r.Username != "" && r.Match.Username == "" {
+		r.Match.Username = r.Username
+	}
+	if r.Hostname != "" && r.Match.Hostname == "" {
+		r.Match.Hostname = r.Hostname
+	}
+	if r.Username == "" && r.Match.Username != "" {
+		r.Username = r.Match.Username
+	}
+	if r.Hostname == "" && r.Match.Hostname != "" {
+		r.Hostname = r.Match.Hostname
+	}
+	return nil
+}
+
+// MarshalYAML encodes a route using the clean, flat syntax.
+func (r Route) MarshalYAML() (interface{}, error) {
+	type flatRoute struct {
+		Username string `yaml:"username,omitempty"`
+		Hostname string `yaml:"hostname,omitempty"`
+		Backend  string `yaml:"backend"`
+	}
+	username := r.Username
+	if username == "" && r.Match.Username != "" {
+		username = r.Match.Username
+	}
+	hostname := r.Hostname
+	if hostname == "" && r.Match.Hostname != "" {
+		hostname = r.Match.Hostname
+	}
+	return flatRoute{
+		Username: username,
+		Hostname: hostname,
+		Backend:  r.Backend,
+	}, nil
 }
 
 // Match is the set of routing predicates. Empty values are wildcards.
 type Match struct {
-	Username string `yaml:"username"`
-	Hostname string `yaml:"hostname"`
+	Username string `yaml:"username,omitempty"`
+	Hostname string `yaml:"hostname,omitempty"`
 }
 
 // Load reads and parses a YAML configuration file.
