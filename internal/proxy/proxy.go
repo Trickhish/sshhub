@@ -47,6 +47,7 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 	}
 
 	sshConfig := &ssh.ServerConfig{
+		MaxAuthTries: 60,
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			backendID, targetUser := s.resolveBackendAndUser(conn.User(), "")
 			if backendID == "" {
