@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Trickhish/sshhub/internal/version"
 	"github.com/hashicorp/yamux"
@@ -152,11 +154,13 @@ func (s *Server) serveAgentUpdate(session *yamux.Session, backendID, binPath str
 
 	sum := sha256.Sum256(data)
 	shaHex := hex.EncodeToString(sum[:])
+	sig := getBinarySignature(binPath, shaHex)
 
 	header := UpdateHeader{
-		Version: version.Version,
-		Size:    int64(len(data)),
-		SHA256:  shaHex,
+		Version:   version.Version,
+		Size:      int64(len(data)),
+		SHA256:    shaHex,
+		Signature: sig,
 	}
 	if err := WriteUpdateHeader(stream, header); err != nil {
 		log.Printf("control: write update header to %s: %v", backendID, err)
@@ -169,6 +173,32 @@ func (s *Server) serveAgentUpdate(session *yamux.Session, backendID, binPath str
 	}
 
 	log.Printf("control: successfully pushed auto-update (v%s, %d bytes) to backend %q", version.Version, len(data), backendID)
+}
+
+func getBinarySignature(binPath, shaHex string) string {
+	// 1. Check for .sig file next to binary
+	sigPath := binPath + ".sig"
+	if data, err := os.ReadFile(sigPath); err == nil {
+		sig := strings.TrimSpace(string(data))
+		if sig != "" {
+			return sig
+		}
+	}
+
+	// 2. Check for release signing key to sign dynamically
+	keyHex := os.Getenv("SSHHUB_RELEASE_KEY")
+	if keyHex == "" {
+		if data, err := os.ReadFile("/etc/sshhub/release.key"); err == nil {
+			keyHex = strings.TrimSpace(string(data))
+		}
+	}
+	if keyHex != "" {
+		if privBytes, err := hex.DecodeString(keyHex); err == nil && len(privBytes) == ed25519.PrivateKeySize {
+			sig := ed25519.Sign(privBytes, []byte(shaHex))
+			return hex.EncodeToString(sig)
+		}
+	}
+	return ""
 }
 
 func findAgentBinary() string {

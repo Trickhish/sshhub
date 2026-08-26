@@ -1,6 +1,7 @@
 package control
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -11,11 +12,13 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/Trickhish/sshhub/internal/version"
 	"github.com/hashicorp/yamux"
 )
 
 // RequestAndApplyUpdate opens an update stream with the hub, receives the new binary,
-// verifies its checksum, replaces the local executable, and restarts the process.
+// verifies its checksum and cryptographic Ed25519 signature, replaces the local executable,
+// and restarts the process.
 func RequestAndApplyUpdate(session *yamux.Session) error {
 	stream, err := session.OpenStream()
 	if err != nil {
@@ -67,6 +70,29 @@ func RequestAndApplyUpdate(session *yamux.Session) error {
 	actualSHA := hex.EncodeToString(hasher.Sum(nil))
 	if header.SHA256 != "" && actualSHA != header.SHA256 {
 		return fmt.Errorf("checksum mismatch: got %s, want %s", actualSHA, header.SHA256)
+	}
+
+	// Cryptographic Ed25519 signature verification against trusted Developer Public Key
+	if version.UpdatePublicKeyHex != "" {
+		if header.Signature == "" {
+			return fmt.Errorf("security error: binary update is missing required Ed25519 cryptographic signature")
+		}
+
+		trustedPubBytes, err := hex.DecodeString(version.UpdatePublicKeyHex)
+		if err != nil || len(trustedPubBytes) != ed25519.PublicKeySize {
+			return fmt.Errorf("invalid trusted public key format: %v", err)
+		}
+
+		sigBytes, err := hex.DecodeString(header.Signature)
+		if err != nil {
+			return fmt.Errorf("invalid signature encoding: %v", err)
+		}
+
+		// Verify signature over the binary SHA256 string
+		if !ed25519.Verify(trustedPubBytes, []byte(actualSHA), sigBytes) {
+			return fmt.Errorf("SECURITY ALERT: Cryptographic signature verification failed! Refusing to install untrusted update")
+		}
+		log.Printf("agent: ✓ Cryptographic Ed25519 signature verified successfully")
 	}
 
 	if err := os.Chmod(tmpPath, 0o755); err != nil {

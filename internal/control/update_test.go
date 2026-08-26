@@ -1,6 +1,9 @@
 package control
 
 import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,7 +14,6 @@ import (
 )
 
 func TestAutoUpdateOverControlPlane(t *testing.T) {
-	// Create dummy new agent binary
 	tmpDir := t.TempDir()
 	binPath := filepath.Join(tmpDir, "sshhub-agent")
 	dummyBinaryContent := []byte("#!/bin/sh\necho updated v2\n")
@@ -19,7 +21,19 @@ func TestAutoUpdateOverControlPlane(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create control server
+	// Sign the binary
+	sum := sha256.Sum256(dummyBinaryContent)
+	shaHex := hex.EncodeToString(sum[:])
+	testPrivKeyHex := "a5a741f7ed783104b06dee91937d1f48a6124b9db60ca1a17244a1b25fce6bc66cd35aeba802f7ee435dab65ca54f1e96202530ab4f666a9fd9bfba4089b00a6"
+	privBytes, _ := hex.DecodeString(testPrivKeyHex)
+	sig := ed25519.Sign(privBytes, []byte(shaHex))
+	sigHex := hex.EncodeToString(sig)
+
+	// Write .sig file
+	if err := os.WriteFile(binPath+".sig", []byte(sigHex), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	registry := NewRegistry()
 	resolveToken := func(token, requested string) (string, bool) {
 		if token == "secret-token" {
@@ -59,7 +73,6 @@ func TestAutoUpdateOverControlPlane(t *testing.T) {
 						UpdateAvailable: true,
 						LatestVersion:   version.Version,
 					})
-					// Serve update stream
 					server.serveAgentUpdate(session, "node1", binPath)
 				}
 			}(conn)
@@ -114,5 +127,8 @@ func TestAutoUpdateOverControlPlane(t *testing.T) {
 	}
 	if header.Size != int64(len(dummyBinaryContent)) {
 		t.Fatalf("expected size %d, got %d", len(dummyBinaryContent), header.Size)
+	}
+	if header.Signature != sigHex {
+		t.Fatalf("expected signature %s, got %s", sigHex, header.Signature)
 	}
 }

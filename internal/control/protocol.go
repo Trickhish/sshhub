@@ -32,9 +32,10 @@ type RegisterResponse struct {
 
 // UpdateHeader describes an update payload sent over an update stream.
 type UpdateHeader struct {
-	Version string `json:"version"`
-	Size    int64  `json:"size"`
-	SHA256  string `json:"sha256"`
+	Version   string `json:"version"`
+	Size      int64  `json:"size"`
+	SHA256    string `json:"sha256"`
+	Signature string `json:"signature,omitempty"` // Ed25519 signature of the SHA256 hex string
 }
 
 // WriteRegister encodes a RegisterRequest onto the stream.
