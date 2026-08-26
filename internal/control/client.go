@@ -75,10 +75,10 @@ func register(session *yamux.Session, backend, token string) (string, error) {
 	}
 
 	if resp.UpdateAvailable {
-		log.Printf("agent: new version %s available. Downloading from GitHub...", resp.LatestVersion)
+		log.Printf("agent: Hub is running version %s (local agent is %s). Downloading update from GitHub...", resp.LatestVersion, version.Version)
 		go func() {
 			if err := DownloadAndApplyGitHubUpdate(resp.LatestVersion); err != nil {
-				log.Printf("agent: github update notice: %v", err)
+				log.Printf("agent: github update: %v", err)
 			}
 		}()
 	}
