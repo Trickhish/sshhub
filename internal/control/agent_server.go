@@ -100,7 +100,7 @@ func (a *AgentServer) handleStream(stream net.Conn) {
 
 	sConn, chans, reqs, err := ssh.NewServerConn(stream, a.sshConfig)
 	if err != nil {
-		log.Printf("agent: handshake failed: %v", err)
+		log.Printf("agent: handshake check failed: %v", err)
 		return
 	}
 	defer sConn.Close()
@@ -335,39 +335,68 @@ func isKeyAuthorized(username, clientKeyStr string) bool {
 	}
 	clientKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(clientKeyStr))
 	if err != nil {
+		log.Printf("agent: parse client public key failed: %v", err)
 		return false
 	}
 	clientKeyBytes := clientKey.Marshal()
+	clientFp := ssh.FingerprintSHA256(clientKey)
 
-	authKeysPath := getAuthorizedKeysPath(username)
-	data, err := os.ReadFile(authKeysPath)
-	if err != nil {
-		log.Printf("agent: read %s: %v", authKeysPath, err)
-		return false
-	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+	paths := getAuthorizedKeysPaths(username)
+	for _, authKeysPath := range paths {
+		data, err := os.ReadFile(authKeysPath)
 		if err != nil {
 			continue
 		}
-		if string(key.Marshal()) == string(clientKeyBytes) {
+
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+			if err != nil {
+				continue
+			}
+			if string(key.Marshal()) == string(clientKeyBytes) {
+				log.Printf("agent: authorized key %s for user %s (matched in %s)", clientFp, username, authKeysPath)
+				return true
+			}
+		}
+	}
+
+	log.Printf("agent: key %s not found in authorized_keys for user %s (checked: %v)", clientFp, username, paths)
+	return false
+}
+
+func getAuthorizedKeysPaths(username string) []string {
+	var paths []string
+
+	if username == "root" || username == "" {
+		paths = append(paths, "/root/.ssh/authorized_keys", "/root/.ssh/authorized_keys2")
+	} else {
+		if u, err := user.Lookup(username); err == nil && u.HomeDir != "" {
+			paths = append(paths, filepath.Join(u.HomeDir, ".ssh", "authorized_keys"))
+			paths = append(paths, filepath.Join(u.HomeDir, ".ssh", "authorized_keys2"))
+		}
+		paths = append(paths, filepath.Join("/home", username, ".ssh", "authorized_keys"))
+	}
+
+	// Also check current process user's ~/.ssh/authorized_keys as fallback
+	if curUser, err := user.Current(); err == nil && curUser.HomeDir != "" {
+		curPath := filepath.Join(curUser.HomeDir, ".ssh", "authorized_keys")
+		if !contains(paths, curPath) {
+			paths = append(paths, curPath)
+		}
+	}
+
+	return paths
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
 			return true
 		}
 	}
 	return false
-}
-
-func getAuthorizedKeysPath(username string) string {
-	if username == "root" || username == "" {
-		return "/root/.ssh/authorized_keys"
-	}
-	if u, err := user.Lookup(username); err == nil && u.HomeDir != "" {
-		return filepath.Join(u.HomeDir, ".ssh", "authorized_keys")
-	}
-	return filepath.Join("/home", username, ".ssh", "authorized_keys")
 }
