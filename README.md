@@ -38,32 +38,39 @@ restricted topologies:
 
 ## How it works
 
-1. A client runs `ssh alice@web1.example.com` and points at the hub's SSH port
-   (directly, or via DNS/`~/.ssh/config`).
-2. The hub inspects the SSH `User` field (the username) and, if SNI-style
-   hostname routing is enabled, the requested hostname.
-3. The hub picks a matching backend and forwards the raw SSH protocol:
-   - **Direct mode:** the hub opens a new TCP connection to the backend's
-     SSH port and bridges the two sockets.
-   - **Reverse mode:** the hub opens a new multiplexed stream over the
-     already-established control connection; the agent bridges that stream to
-     the local `sshd`.
-4. The client and the backend complete their normal SSH handshake end to end.
-   The hub never needs the client's private keys or the backend's credentials.
+1. A client connects to the hub's SSH port and authenticates against the hub's
+   `authorized_keys` file.
+2. The hub inspects the SSH username. A username of the form `alice@web1` is
+   split into username `alice` and hostname `web1`; a plain username leaves the
+   hostname empty.
+3. The hub matches the username/hostname against the routing rules to pick a
+   backend.
+4. The hub opens an SSH connection to the backend:
+   - **Direct mode:** the hub dials the backend's SSH address.
+   - **Reverse mode:** the hub opens a multiplexed stream over the agent's
+     control connection; the agent bridges that stream to the local `sshd`.
+5. The hub authenticates to the backend with the per-backend key or password,
+   then bridges the client's channels (shell, exec, port forwards) end to end.
 
 ## Routing
 
 Routing rules are evaluated top to bottom; the first match wins. A rule can
 match on any combination of:
 
-| Field      | Meaning                                    | Example value            |
-| ---------- | ------------------------------------------ | ------------------------ |
-| `username` | SSH `User` field from the client           | `alice`                  |
-| `hostname` | Requested hostname (requires SNI support)  | `web1.example.com`       |
-| `backend`  | Target backend to forward the connection to | `web1`                   |
+| Field      | Meaning                                          | Example value      |
+| ---------- | ------------------------------------------------ | ------------------ |
+| `username` | SSH username (before `@`) from the client        | `alice`            |
+| `hostname` | Requested hostname (the part after `@`)          | `web1.example.com` |
+| `backend`  | Target backend to forward the connection to      | `web1`             |
 
 Wildcards (`*`) are supported in both `username` and `hostname`. If no rule
 matches, the connection is rejected.
+
+To route by hostname, the client includes it in the login name:
+
+```sh
+ssh -l alice@web1.example.com sshhub.example.com
+```
 
 ## Building
 
@@ -83,6 +90,12 @@ listen:
   ssh: ":22"       # where SSH clients connect
   control: ":7000" # where agents connect (reverse mode)
 
+# The hub's own SSH host key.
+host_key: "/etc/sshhub/ssh_host_ed25519_key"
+
+# Public keys allowed to connect to the hub.
+authorized_keys: "/etc/sshhub/authorized_keys"
+
 # Tokens agents must present when connecting to the control plane.
 control_tokens:
   - "change-me-agent-secret"
@@ -91,10 +104,15 @@ backends:
   - id: web1
     mode: direct                 # hub dials this server
     address: "10.0.0.10:22"
-    host_key: "ssh-ed25519 AAAA..."
+    username: "deploy"           # user the hub logs in as (defaults to the client's username)
+    auth:
+      private_key: "/etc/sshhub/backend_keys/web1"
+    host_key: "ssh-ed25519 AAAA..."   # pinned backend host key
 
   - id: db1
     mode: reverse                # server dials the hub
+    auth:
+      private_key: "/etc/sshhub/backend_keys/db1"
     # no address needed; the agent registers its availability
 
 routes:
@@ -135,14 +153,15 @@ this connection.
 
 ## Security considerations
 
-- **TLS everywhere:** the control plane listener should be served over TLS;
-  agents must verify the hub's certificate and vice versa.
+- **TLS everywhere:** the control plane listener can be served over TLS
+  (`tls_cert`/`tls_key`); agents should verify the hub's certificate.
 - **Token hygiene:** rotate control tokens; prefer per-backend tokens over a
   single shared token.
-- **Least privilege:** the hub never terminates SSH authentication itself, so
-  user keys and passwords pass straight through to the backend.
-- **Host key pinning:** for direct mode, pin the backend's SSH host key in the
-  configuration to prevent man-in-the-middle attacks.
+- **Least privilege:** the hub authenticates clients against `authorized_keys`
+  and then authenticates to backends with its own per-backend key, so client
+  credentials never leave the client.
+- **Host key pinning:** pin each backend's SSH host key (`host_key` or
+  `host_key_file`) to prevent man-in-the-middle attacks.
 - **Exposure:** bind the SSH listener to a network you trust, and rate-limit or
   fail2ban the control listener.
 
@@ -156,11 +175,11 @@ this connection.
 
 ## Roadmap
 
-- [ ] SNI-based hostname routing on the SSH listener.
 - [ ] per-backend authentication tokens.
 - [ ] connection metrics and an admin API.
-- [ ] wildcard and regex matching in routing rules.
+- [ ] regex matching in routing rules.
 - [ ] SSH agent forwarding passthrough.
+- [ ] TLS between the hub and agents (control plane encryption).
 
 ## License
 
