@@ -1,15 +1,12 @@
 # sshhub
 
 SSHub is an SSH gateway that acts as a single entry point and transparently
-routes each incoming SSH connection to a backend server. Routing is decided by
-the **username**, the **requested hostname**, or a combination of both.
+routes incoming SSH connections to backend servers using **pure Layer-4 passthrough**.
 
-SSHub allows **direct SSH connections with zero client configuration**:
-- `ssh -p 2222 cidev@sshhub.example.com`
-- `ssh -p 2222 root@cidev@sshhub.example.com`
-- `ssh -p 2222 alice@web1@sshhub.example.com`
-
-It also supports standard **ProxyJump (`-J`)** and **`ProxyCommand`** (`direct-tcpip`) passthrough.
+SSHub relays the raw, end-to-end encrypted SSH stream between the client and the
+backend `sshd`. Client credentials, public keys, and host keys are negotiated
+directly between the client and the backend server without the hub terminating
+or impersonating authentication.
 
 SSHub supports two transport models so it fits both classic and NAT/firewall
 restricted topologies:
@@ -23,8 +20,8 @@ restricted topologies:
                           ┌────────────────────────────┐
                           │        sshhub (hub)        │
                           │                            │
-   ssh -p 2222 cidev@hub ─▶│  :2222 SSH listener       │
-   ssh -J hub backend   ──▶│  :7000 control listener   │
+   ssh -J hub backend ───▶│  :2222 SSH listener       │
+                          │  :7000 control listener   │
                           └───────┬────────────┬───────┘
                           direct  │            │ reverse
                           dial    │            │ (agents dial in)
@@ -36,54 +33,39 @@ restricted topologies:
 
 ## Features
 
-- **Direct login (Zero Client Config):** Connect straight into any backend with standard `ssh user@backend@hub` or `ssh backend@hub`. Full interactive PTY, shell, commands, window resizing, SFTP, and signals.
-- **ProxyJump / Passthrough:** Works seamlessly with `ssh -J` and `ssh -W` (`direct-tcpip`) for raw byte bridging.
-- **Dynamic Routing:** Route SSH connections by username, hostname, or glob patterns.
+- **End-to-End Cryptographic Passthrough:** Client authenticates directly against the backend `sshd` with the client's own key or password. The hub never stores or impersonates backend credentials.
+- **Zero-Knowledge Gateway:** The hub only sees encrypted traffic and bridges `direct-tcpip` channels.
+- **Dynamic Routing:** Route SSH connections by hostname, username, or glob patterns.
 - **Direct & Reverse Transports:** Direct TCP connections for public servers and yamux multiplexed reverse tunnels for hosts behind NAT.
-- **Central Host Key Authorization:** Authorize the Hub's public key once in `/root/.ssh/authorized_keys` across backends.
 - **Single Static Binaries:** Zero dependencies for `sshhub` gateway and `sshhub-agent`.
 
 ## Connecting
 
-### 1. Direct SSH Connection (No Client Config Required)
-
-Connect straight through the gateway specifying either the backend or `user@backend`:
-
-```sh
-# Login directly as the backend's configured user (or root)
-ssh -p 2222 cidev@cdn.srv.dury.dev
-
-# Specify a custom remote user with user@backend
-ssh -p 2222 root@cidev@cdn.srv.dury.dev
-ssh -p 2222 alice@web1@cdn.srv.dury.dev
-
-# Run non-interactive commands
-ssh -p 2222 cidev@cdn.srv.dury.dev "hostname -f && uptime"
-```
-
-### 2. Using ProxyJump (`-J`)
+### 1. Using ProxyJump (`-J`)
 
 ```sh
 ssh -J cdn.srv.dury.dev:2222 root@cidev
 ```
 
-### 3. Using `~/.ssh/config`
+### 2. Using `~/.ssh/config` (Simple 1-Command Access)
+
+Add this block to your local machine's `~/.ssh/config`:
 
 ```sshconfig
-Host cdn.hub
-  HostName cdn.srv.dury.dev
-  Port 2222
-
-Host cidev
-  HostName cdn.srv.dury.dev
-  Port 2222
-  User cidev
+Host *.hub cidev web1
+  ProxyJump cdn.srv.dury.dev:2222
 ```
 
-Then simply run:
+Once configured, you can connect directly with no extra flags:
 
 ```sh
-ssh cidev
+ssh root@cidev
+```
+
+### 3. Using ProxyCommand (`-W`)
+
+```sh
+ssh -o ProxyCommand="ssh -p 2222 -W %h:%p cdn.srv.dury.dev" root@cidev
 ```
 
 ## Routing
@@ -93,12 +75,11 @@ match on any combination of:
 
 | Field      | Meaning                                          | Example value      |
 | ---------- | ------------------------------------------------ | ------------------ |
-| `username` | SSH username (before `@`) from the client        | `alice`            |
-| `hostname` | Requested hostname (or target host after `@`)   | `web1.example.com` |
-| `backend`  | Target backend to forward the connection to      | `web1`             |
+| `username` | SSH username from the client                     | `alice`            |
+| `hostname` | Target hostname after `@` (e.g. `root@cidev`)    | `cidev`            |
+| `backend`  | Target backend to forward the connection to      | `cidev`            |
 
-Wildcards (`*`) are supported in both `username` and `hostname`. If no rule
-matches, the connection is rejected.
+Wildcards (`*`) are supported in both `username` and `hostname`.
 
 ## Building
 
@@ -121,8 +102,8 @@ listen:
 # The hub's SSH host key.
 host_key: "/etc/sshhub/ssh_host_ed25519_key"
 
-# (Optional) Public keys allowed to connect through the hub.
-# If omitted, any authenticated client can connect.
+# (Optional) Public keys allowed to connect to the hub.
+# If omitted, any client can open passthrough tunnels to configured backends.
 authorized_keys: "/etc/sshhub/authorized_keys"
 
 # Tokens agents must present when connecting to the control plane.
@@ -136,16 +117,14 @@ backends:
 
   - id: cidev
     mode: reverse                # server dials the hub via sshhub-agent
-    username: "root"
 
 routes:
   - match:
-      username: "deploy"
-      hostname: "web1.example.com"
+      hostname: "web1"
     backend: web1
 
   - match:
-      username: "cidev"
+      hostname: "cidev"
     backend: cidev
 
   # default fallback
@@ -169,10 +148,6 @@ sshhub-agent \
   --backend cidev \
   --sshd 127.0.0.1:22
 ```
-
-The agent connects out to the hub, authenticates with its token, and registers
-`cidev` as available. Incoming client sessions for `cidev` are then multiplexed over
-this single outbound connection.
 
 ## License
 
