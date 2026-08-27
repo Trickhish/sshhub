@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -69,10 +70,14 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 				}
 			}
 
-			// Verify with backend agent in real-time during the handshake for reverse backends
+			// Verify with backend in real-time during the handshake:
 			if backend.Mode == "reverse" {
 				if err := s.verifyBackendAgentKey(backend, targetUser, key); err != nil {
 					return nil, fmt.Errorf("unauthorized key for backend %s", backendID)
+				}
+			} else if s.cfg.AuthorizedKeys != "" {
+				if err := s.verifyDirectBackendKey(targetUser, key); err != nil {
+					return nil, fmt.Errorf("unauthorized key for backend %s: %w", backendID, err)
 				}
 			}
 
@@ -97,6 +102,51 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 	s.sshConfig = sshConfig
 
 	return s, nil
+}
+
+// verifyDirectBackendKey checks if the public key is authorized in local authorized_keys files.
+func (s *Server) verifyDirectBackendKey(targetUser string, key ssh.PublicKey) error {
+	if s.cfg.AuthorizedKeys != "" {
+		keys, err := loadAuthorizedKeys(s.cfg.AuthorizedKeys)
+		if err != nil {
+			return err
+		}
+		if _, ok := keys[string(key.Marshal())]; ok {
+			return nil
+		}
+		return fmt.Errorf("key not found in configured authorized_keys")
+	}
+
+	paths := []string{
+		"/root/.ssh/authorized_keys",
+		"/root/.ssh/authorized_keys2",
+	}
+	if targetUser != "" && targetUser != "root" {
+		paths = append(paths,
+			fmt.Sprintf("/home/%s/.ssh/authorized_keys", targetUser),
+			fmt.Sprintf("/home/%s/.ssh/authorized_keys2", targetUser),
+		)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths,
+			filepath.Join(home, ".ssh", "authorized_keys"),
+			filepath.Join(home, ".ssh", "authorized_keys2"),
+		)
+	}
+
+	for _, p := range paths {
+		if data, err := os.ReadFile(p); err == nil {
+			for len(data) > 0 {
+				authedKey, _, _, rest, err := ssh.ParseAuthorizedKey(data)
+				if err == nil && string(authedKey.Marshal()) == string(key.Marshal()) {
+					return nil
+				}
+				data = rest
+			}
+		}
+	}
+
+	return fmt.Errorf("key %s not found in local authorized_keys for user %s", ssh.FingerprintSHA256(key), targetUser)
 }
 
 // verifyBackendAgentKey validates the client's public key with the backend agent during the handshake.
@@ -378,7 +428,7 @@ func (s *Server) dialBackend(backend *config.Backend) (net.Conn, error) {
 	return net.Dial("tcp", backend.Address)
 }
 
-// dialBackendAgent opens a connection to the backend agent and passes the client's public key / password for authorization.
+// dialBackendAgent opens a connection to the backend and passes proper authentication for authorization.
 func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, perms *ssh.Permissions) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	rawConn, err := s.dialBackend(backend)
 	if err != nil {
@@ -394,12 +444,17 @@ func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, pe
 	}
 
 	var auth []ssh.AuthMethod
-	if perms != nil && perms.Extensions != nil {
-		if pubkey := perms.Extensions["pubkey"]; pubkey != "" {
-			auth = append(auth, ssh.Password(pubkey))
-		} else if password := perms.Extensions["password"]; password != "" {
-			auth = append(auth, ssh.Password(password))
+	if backend.Mode == "reverse" {
+		if perms != nil && perms.Extensions != nil {
+			if pubkey := perms.Extensions["pubkey"]; pubkey != "" {
+				auth = append(auth, ssh.Password(pubkey))
+			} else if password := perms.Extensions["password"]; password != "" {
+				auth = append(auth, ssh.Password(password))
+			}
 		}
+	} else {
+		// Mode == "direct": use direct auth methods (configured key, gateway host key, or forwarded password)
+		auth = s.buildDirectAuthMethods(backend, perms)
 	}
 
 	clientConfig := &ssh.ClientConfig{
@@ -409,6 +464,63 @@ func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, pe
 	}
 
 	return ssh.NewClientConn(rawConn, backend.ID, clientConfig)
+}
+
+func (s *Server) buildDirectAuthMethods(backend *config.Backend, perms *ssh.Permissions) []ssh.AuthMethod {
+	var methods []ssh.AuthMethod
+
+	// 1. Explicit backend.Auth config
+	if backend.Auth != nil {
+		if backend.Auth.Password != "" {
+			methods = append(methods, ssh.Password(backend.Auth.Password))
+		}
+		if backend.Auth.PrivateKey != "" {
+			if signer, err := ssh.ParsePrivateKey([]byte(backend.Auth.PrivateKey)); err == nil {
+				methods = append(methods, ssh.PublicKeys(signer))
+			}
+		}
+		if backend.Auth.PrivateKeyFile != "" {
+			if data, err := os.ReadFile(backend.Auth.PrivateKeyFile); err == nil {
+				if signer, err := ssh.ParsePrivateKey(data); err == nil {
+					methods = append(methods, ssh.PublicKeys(signer))
+				}
+			}
+		}
+	}
+
+	// 2. Client forwarded password (if client authenticated with password)
+	if perms != nil && perms.Extensions != nil {
+		if pass := perms.Extensions["password"]; pass != "" {
+			methods = append(methods, ssh.Password(pass))
+		}
+	}
+
+	// 3. Gateway Host Key & Default private keys (~/.ssh/id_ed25519, ~/.ssh/id_rsa, /root/.ssh/...)
+	keyCandidates := []string{
+		s.cfg.HostKey,
+		"/root/.ssh/id_ed25519",
+		"/root/.ssh/id_rsa",
+		"/root/.ssh/id_ecdsa",
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		keyCandidates = append(keyCandidates,
+			filepath.Join(home, ".ssh", "id_ed25519"),
+			filepath.Join(home, ".ssh", "id_rsa"),
+		)
+	}
+
+	for _, kpath := range keyCandidates {
+		if kpath == "" {
+			continue
+		}
+		if data, err := os.ReadFile(kpath); err == nil {
+			if signer, err := ssh.ParsePrivateKey(data); err == nil {
+				methods = append(methods, ssh.PublicKeys(signer))
+			}
+		}
+	}
+
+	return methods
 }
 
 // resolveBackendAndUser extracts the target backend ID and the backend username from

@@ -151,6 +151,14 @@ if [[ ! -f "$HOST_KEY" ]]; then
   echo "--> Generating SSH host key at $HOST_KEY..."
   ssh-keygen -t ed25519 -N "" -f "$HOST_KEY" >/dev/null
 fi
+if [[ -f "${HOST_KEY}.pub" ]]; then
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+  PUB_CONTENT=$(cat "${HOST_KEY}.pub")
+  if ! grep -Fxq "$PUB_CONTENT" /root/.ssh/authorized_keys 2>/dev/null; then
+    echo "$PUB_CONTENT" >> /root/.ssh/authorized_keys
+  fi
+fi
 
 # 7. Create default sshhub.yaml if missing
 if [[ ! -f "$CONFIG_FILE" ]]; then

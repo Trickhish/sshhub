@@ -41,8 +41,9 @@ type Backend struct {
 
 // Auth holds the credentials the hub uses to authenticate to a backend.
 type Auth struct {
-	PrivateKey string `yaml:"private_key,omitempty"`
-	Password   string `yaml:"password,omitempty"`
+	PrivateKey     string `yaml:"private_key,omitempty"`
+	PrivateKeyFile string `yaml:"private_key_file,omitempty"`
+	Password       string `yaml:"password,omitempty"`
 }
 
 // Route maps a matching request to a backend.
