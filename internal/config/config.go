@@ -13,7 +13,6 @@ type Config struct {
 	Listen         Listen    `yaml:"listen"`
 	PublicHost     string    `yaml:"public_host,omitempty"`
 	HostKey        string    `yaml:"host_key"`
-	AuthorizedKeys string    `yaml:"authorized_keys,omitempty"`
 	TLSCert        string    `yaml:"tls_cert,omitempty"`
 	TLSKey         string    `yaml:"tls_key,omitempty"`
 	ControlTokens  []string  `yaml:"control_tokens,omitempty"`
@@ -30,20 +29,12 @@ type Listen struct {
 // Backend describes a single SSH backend server.
 type Backend struct {
 	ID          string `yaml:"id"`
-	Mode        string `yaml:"mode"` // "direct" or "reverse"
+	Mode        string `yaml:"mode"` // must be "reverse" (agent-backed); "direct" is no longer supported
 	Token       string `yaml:"token,omitempty"` // per-backend token for reverse mode
 	Address     string `yaml:"address,omitempty"`
 	Username    string `yaml:"username,omitempty"`
-	Auth        *Auth  `yaml:"auth,omitempty"`
 	HostKey     string `yaml:"host_key,omitempty"`
 	HostKeyFile string `yaml:"host_key_file,omitempty"`
-}
-
-// Auth holds the credentials the hub uses to authenticate to a backend.
-type Auth struct {
-	PrivateKey     string `yaml:"private_key,omitempty"`
-	PrivateKeyFile string `yaml:"private_key_file,omitempty"`
-	Password       string `yaml:"password,omitempty"`
 }
 
 // Route maps a matching request to a backend.
@@ -168,14 +159,13 @@ func (c *Config) Validate() error {
 		}
 
 		switch b.Mode {
-		case "direct":
-			if b.Address == "" {
-				return fmt.Errorf("backend %q: address is required for direct mode", b.ID)
-			}
 		case "reverse":
-			// reverse backends are reached via the control plane.
+			// reverse backends are reached via the control plane (sshhub-agent).
+		case "direct":
+			return fmt.Errorf("backend %q: \"direct\" mode is no longer supported for security reasons; "+
+				"run sshhub-agent on the target and use mode \"reverse\" instead", b.ID)
 		default:
-			return fmt.Errorf("backend %q: mode must be \"direct\" or \"reverse\"", b.ID)
+			return fmt.Errorf("backend %q: mode must be \"reverse\"", b.ID)
 		}
 	}
 

@@ -14,10 +14,10 @@ import (
 
 	"github.com/Trickhish/sshhub/internal/config"
 	"github.com/Trickhish/sshhub/internal/control"
+	"github.com/hashicorp/yamux"
 	"golang.org/x/crypto/ssh"
 )
 
-// generateKey returns an SSH signer and its PEM-encoded private key.
 func generateKey(t *testing.T) (ssh.Signer, string) {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -44,41 +44,47 @@ func writeFile(t *testing.T, dir, name, content string) string {
 	return path
 }
 
-// startDirectBackend runs a standard SSH server for ProxyJump tests.
-func startDirectBackend(t *testing.T, allowedKey ssh.PublicKey) string {
-	t.Helper()
-	hostSigner, _ := generateKey(t)
-
-	serverConfig := &ssh.ServerConfig{
-		PublicKeyCallback: func(m ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if string(key.Marshal()) == string(allowedKey.Marshal()) {
-				return nil, nil
-			}
-			return nil, fmt.Errorf("unauthorized key on backend")
-		},
-	}
-	serverConfig.AddHostKey(hostSigner)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go handleDirectConn(conn, serverConfig)
-		}
-	}()
-	return ln.Addr().String()
+// stubAgent emulates sshhub-agent's auth contract: the hub connects and offers the
+// client's marshaled public key in the SSH password field; the agent authorizes it
+// against an allowlist and, on success, serves a trivial exec. It is served over
+// each accepted yamux stream, exactly like the real agent's ServeStreams.
+type stubAgent struct {
+	cfg *ssh.ServerConfig
 }
 
-func handleDirectConn(conn net.Conn, cfg *ssh.ServerConfig) {
-	sConn, chans, reqs, err := ssh.NewServerConn(conn, cfg)
+func newStubAgent(t *testing.T, allowed ssh.PublicKey) *stubAgent {
+	t.Helper()
+	hostSigner, _ := generateKey(t)
+	allowedMarshaled := string(allowed.Marshal())
+
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			key, _, _, _, err := ssh.ParseAuthorizedKey(password)
+			if err != nil {
+				return nil, fmt.Errorf("bad key")
+			}
+			if string(key.Marshal()) != allowedMarshaled {
+				return nil, fmt.Errorf("unauthorized key")
+			}
+			return &ssh.Permissions{}, nil
+		},
+	}
+	cfg.AddHostKey(hostSigner)
+	return &stubAgent{cfg: cfg}
+}
+
+func (a *stubAgent) serveStreams(ctx context.Context, session *yamux.Session) {
+	for {
+		stream, err := session.Accept()
+		if err != nil {
+			return
+		}
+		go a.serve(stream)
+	}
+}
+
+func (a *stubAgent) serve(conn net.Conn) {
+	sConn, chans, reqs, err := ssh.NewServerConn(conn, a.cfg)
 	if err != nil {
 		conn.Close()
 		return
@@ -94,111 +100,31 @@ func handleDirectConn(conn net.Conn, cfg *ssh.ServerConfig) {
 		if err != nil {
 			return
 		}
-		for req := range chReqs {
-			switch req.Type {
-			case "exec":
-				req.Reply(true, nil)
-				ch.Write([]byte("hello from direct backend"))
-				ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{}))
-				ch.Close()
-				return
-			default:
+		go func() {
+			for req := range chReqs {
+				if req.Type == "exec" {
+					req.Reply(true, nil)
+					ch.Write([]byte("hello from agent backend"))
+					ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{}))
+					ch.Close()
+					return
+				}
 				req.Reply(false, nil)
 			}
-		}
+		}()
 	}
 }
 
-// runDirectSSH dials hub directly (e.g. ssh user@hub or ssh backend@hub) and runs exec.
-func runDirectSSH(t *testing.T, hubAddr, loginUser string, clientSigner ssh.Signer) (string, error) {
+// testHub starts a full hub (control plane + ssh listener) and connects a stub agent
+// as backend "cidev" via the real control-plane handshake. Returns the hub ssh addr.
+func testHub(t *testing.T, allowed ssh.PublicKey, routes []config.Route) string {
 	t.Helper()
-	var auth []ssh.AuthMethod
-	if clientSigner != nil {
-		auth = []ssh.AuthMethod{ssh.PublicKeys(clientSigner)}
-	}
-	client, err := ssh.Dial("tcp", hubAddr, &ssh.ClientConfig{
-		User:            loginUser,
-		Auth:            auth,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	})
-	if err != nil {
-		return "", err
-	}
-	defer client.Close()
-
-	session, err := client.NewSession()
-	if err != nil {
-		return "", err
-	}
-	defer session.Close()
-
-	out, err := session.Output("echo hi")
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
-// runProxyJump dials hub and opens direct-tcpip channel.
-func runProxyJump(t *testing.T, hubAddr, hubUser string, hubSigner ssh.Signer, target, backendUser string, backendSigner ssh.Signer) string {
-	t.Helper()
-	var auth []ssh.AuthMethod
-	if hubSigner != nil {
-		auth = []ssh.AuthMethod{ssh.PublicKeys(hubSigner)}
-	}
-	hubClient, err := ssh.Dial("tcp", hubAddr, &ssh.ClientConfig{
-		User:            hubUser,
-		Auth:            auth,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	})
-	if err != nil {
-		t.Fatalf("dial hub: %v", err)
-	}
-	defer hubClient.Close()
-
-	conn, err := hubClient.Dial("tcp", target)
-	if err != nil {
-		t.Fatalf("dial direct-tcpip %q: %v", target, err)
-	}
-	defer conn.Close()
-
-	ncc, chans, reqs, err := ssh.NewClientConn(conn, target, &ssh.ClientConfig{
-		User:            backendUser,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(backendSigner)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	})
-	if err != nil {
-		t.Fatalf("backend handshake: %v", err)
-	}
-	backendClient := ssh.NewClient(ncc, chans, reqs)
-	defer backendClient.Close()
-
-	session, err := backendClient.NewSession()
-	if err != nil {
-		t.Fatalf("new backend session: %v", err)
-	}
-	defer session.Close()
-
-	out, err := session.Output("echo hi")
-	if err != nil {
-		t.Fatalf("exec: %v", err)
-	}
-	return string(out)
-}
-
-func TestDirectSession_AgentAuth(t *testing.T) {
-	authorizedClientSigner, _ := generateKey(t)
-	unauthorizedClientSigner, _ := generateKey(t)
-	_, hubHostPEM := generateKey(t)
-
-	dir := t.TempDir()
-	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
 
 	registry := control.NewRegistry()
-
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 
+	// Control server.
 	controlLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -213,18 +139,28 @@ func TestDirectSession_AgentAuth(t *testing.T) {
 		return "", false
 	}, nil)
 	go controlServer.ListenAndServe(ctx, controlAddr)
+	time.Sleep(50 * time.Millisecond)
+
+	// Stub agent connects to the control plane as backend "cidev".
+	session, _, err := control.Connect(ctx, controlAddr, "cidev", "secret", nil)
+	if err != nil {
+		t.Fatalf("agent connect: %v", err)
+	}
+	t.Cleanup(func() { session.Close() })
+	agent := newStubAgent(t, allowed)
+	go agent.serveStreams(ctx, session)
+
+	// Hub SSH front end.
+	_, hubHostPEM := generateKey(t)
+	dir := t.TempDir()
+	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
 
 	cfg := &config.Config{
-		Listen:  config.Listen{SSH: "127.0.0.1:0", Control: controlAddr},
-		HostKey: hostKey,
-		Backends: []config.Backend{
-			{ID: "cidev", Mode: "reverse", Token: "secret"},
-		},
-		Routes: []config.Route{
-			{Username: "*", Backend: "cidev"},
-		},
+		Listen:   config.Listen{SSH: "127.0.0.1:0", Control: controlAddr},
+		HostKey:  hostKey,
+		Backends: []config.Backend{{ID: "cidev", Mode: "reverse", Token: "secret"}},
+		Routes:   routes,
 	}
-
 	server, err := New(cfg, registry)
 	if err != nil {
 		t.Fatal(err)
@@ -238,19 +174,7 @@ func TestDirectSession_AgentAuth(t *testing.T) {
 	sshLn.Close()
 	go server.Serve(ctx, sshAddr)
 
-	time.Sleep(100 * time.Millisecond)
-	session, _, err := control.Connect(ctx, controlAddr, "", "secret", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-
-	agentServer, err := control.NewAgentServer()
-	if err != nil {
-		t.Fatal(err)
-	}
-	go agentServer.ServeStreams(ctx, session)
-
+	// Wait for the backend to be registered.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := registry.Open(ctx, "cidev"); err == nil {
@@ -261,61 +185,88 @@ func TestDirectSession_AgentAuth(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-
-	// 1. Authorized client key (since authorizedClientSigner is in /root/.ssh/authorized_keys if we test or mock it)
-	// We can test executing a command directly:
-	out, err := runDirectSSH(t, sshAddr, "cidev", authorizedClientSigner)
-	if err != nil {
-		t.Logf("direct session with authorized key result: %v, out: %q", err, out)
-	}
-
-	// 2. Unauthorized client key:
-	_, err = runDirectSSH(t, sshAddr, "cidev", unauthorizedClientSigner)
-	if err == nil {
-		t.Fatal("expected unauthorized key to be rejected by agent")
-	}
+	time.Sleep(50 * time.Millisecond)
+	return sshAddr
 }
 
-func TestProxyJump_Passthrough(t *testing.T) {
+func dialHubExec(hubAddr, loginUser string, auth []ssh.AuthMethod) (string, error) {
+	client, err := ssh.Dial("tcp", hubAddr, &ssh.ClientConfig{
+		User:            loginUser,
+		Auth:            auth,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         3 * time.Second,
+	})
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return "", err
+	}
+	defer session.Close()
+	out, err := session.Output("echo hi")
+	return string(out), err
+}
+
+func catchAll() []config.Route { return []config.Route{{Username: "*", Backend: "cidev"}} }
+
+// A client whose key is authorized on the backend gets a working session (zero-arg).
+func TestAuthorizedKey_Succeeds(t *testing.T) {
 	clientSigner, _ := generateKey(t)
-	_, hubHostPEM := generateKey(t)
+	hubAddr := testHub(t, clientSigner.PublicKey(), catchAll())
 
-	backendAddr := startDirectBackend(t, clientSigner.PublicKey())
-
-	dir := t.TempDir()
-	hostKey := writeFile(t, dir, "host_key", hubHostPEM)
-
-	cfg := &config.Config{
-		Listen:  config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
-		HostKey: hostKey,
-		Backends: []config.Backend{
-			{ID: "web1", Mode: "direct", Address: backendAddr},
-		},
-		Routes: []config.Route{
-			{Match: config.Match{Username: "*"}, Backend: "web1"},
-		},
-	}
-
-	server, err := New(cfg, control.NewRegistry())
+	out, err := dialHubExec(hubAddr, "cidev", []ssh.AuthMethod{ssh.PublicKeys(clientSigner)})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("authorized client should succeed, got: %v", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-
-	go server.Serve(ctx, addr)
-	time.Sleep(100 * time.Millisecond)
-
-	out := runProxyJump(t, addr, "anyone", clientSigner, "web1:22", "root", clientSigner)
-	if out != "hello from direct backend" {
-		t.Fatalf("got %q, want %q", out, "hello from direct backend")
+	if out != "hello from agent backend" {
+		t.Fatalf("got %q, want %q", out, "hello from agent backend")
 	}
 }
 
+// A client whose key is NOT authorized on the backend is rejected at the hub (fail closed).
+func TestUnauthorizedKey_Rejected(t *testing.T) {
+	authorized, _ := generateKey(t)
+	attacker, _ := generateKey(t)
+	hubAddr := testHub(t, authorized.PublicKey(), catchAll())
+
+	if _, err := dialHubExec(hubAddr, "cidev", []ssh.AuthMethod{ssh.PublicKeys(attacker)}); err == nil {
+		t.Fatal("unauthorized key MUST be rejected by the hub")
+	}
+}
+
+// The hub MUST NOT accept password authentication (root cause of the 2026-08 compromise).
+func TestPasswordAuth_Rejected(t *testing.T) {
+	authorized, _ := generateKey(t)
+	hubAddr := testHub(t, authorized.PublicKey(), catchAll())
+
+	for _, pw := range []string{"", "anything", "root", "hunter2"} {
+		if _, err := dialHubExec(hubAddr, "cidev", []ssh.AuthMethod{ssh.Password(pw)}); err == nil {
+			t.Fatalf("password auth (%q) MUST be rejected by the hub", pw)
+		}
+	}
+}
+
+// A login matching no route is rejected.
+func TestNoRoute_Rejected(t *testing.T) {
+	clientSigner, _ := generateKey(t)
+	hubAddr := testHub(t, clientSigner.PublicKey(), []config.Route{{Match: config.Match{Hostname: "cidev"}, Backend: "cidev"}})
+
+	if _, err := dialHubExec(hubAddr, "does-not-exist", []ssh.AuthMethod{ssh.PublicKeys(clientSigner)}); err == nil {
+		t.Fatal("login with no matching route MUST be rejected")
+	}
+}
+
+// Config validation must refuse "direct" backends.
+func TestDirectMode_Rejected(t *testing.T) {
+	cfg := &config.Config{
+		Listen:   config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
+		HostKey:  "/dev/null",
+		Backends: []config.Backend{{ID: "x", Mode: "direct", Address: "127.0.0.1:22"}},
+		Routes:   []config.Route{{Username: "*", Backend: "x"}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("config.Validate MUST reject direct-mode backends")
+	}
+}

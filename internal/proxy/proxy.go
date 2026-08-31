@@ -1,12 +1,28 @@
-// Package proxy implements transparent SSH routing between clients and backends.
+// Package proxy routes SSH clients to agent-backed backends over the control plane.
 //
-// Clients can connect directly using standard SSH commands (e.g. ssh -p 2222 cidev@hub
-// or ssh -p 2222 root@cidev@hub) with full interactive shells, PTYs, exec, and signals,
-// or connect via ProxyJump (-J) / direct-tcpip.
+// SECURITY MODEL — AGENT-ONLY, NO HUB-HELD CREDENTIALS:
 //
-// In direct session mode, the hub delegates authentication to the backend agent in real-time,
-// checking the connecting client's actual public key against the backend's local authorized_keys
-// file during the SSH handshake before accepting the key or spawning a PTY.
+// The hub NEVER holds or uses any credential to authenticate to a backend, and it
+// NEVER accepts password authentication from clients. Every backend runs an
+// sshhub-agent that reaches the hub via an outbound reverse tunnel. Authentication
+// is delegated to the agent, which verifies the connecting client's OWN public key
+// against the backend's local authorized_keys before any session is created.
+//
+// Concretely, for each client the hub:
+//  1. Requires public-key auth (no passwords). It captures the client's public key.
+//  2. Verifies that key WITH THE AGENT during the handshake (the agent checks it
+//     against the backend's authorized_keys). Unknown/unauthorized keys are
+//     rejected here — the hub fails closed.
+//  3. Relays the client's session to the agent, passing the (verified) client key
+//     so the agent spawns the shell as the authorized user.
+//
+// Because the hub only ever forwards the CLIENT's key for verification and holds no
+// keys/passwords/tokens that grant backend shell access, a compromise of the hub at
+// rest yields no backend access. (A live hub compromise can observe an in-flight
+// session — an unavoidable property of any username-routed jump host — but cannot
+// obtain durable, standalone access to any backend.)
+//
+// Usage (zero-arg): ssh cidev@hub   /   ssh nuc@hub
 package proxy
 
 import (
@@ -16,7 +32,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -26,7 +41,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Server routes SSH clients to backends.
+// Server routes SSH clients to agent-backed backends.
 type Server struct {
 	cfg       *config.Config
 	registry  *control.Registry
@@ -48,9 +63,14 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 	}
 
 	sshConfig := &ssh.ServerConfig{
-		MaxAuthTries: 60,
+		MaxAuthTries: 6,
+
+		// Public-key only. The hub verifies the client's key WITH THE AGENT
+		// (which checks the backend's authorized_keys) and fails closed on any
+		// error. The hub asserts no identity of its own and holds no key that
+		// authenticates to a backend.
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			backendID, targetUser := s.resolveBackendAndUser(conn.User(), "")
+			backendID, targetUser := s.resolveBackendAndUser(conn.User())
 			if backendID == "" {
 				return nil, fmt.Errorf("no route for user %q", conn.User())
 			}
@@ -59,26 +79,9 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 				return nil, fmt.Errorf("backend %q not found", backendID)
 			}
 
-			// If hub has authorized_keys configured, check hub filter first
-			if cfg.AuthorizedKeys != "" {
-				keys, err := loadAuthorizedKeys(cfg.AuthorizedKeys)
-				if err != nil {
-					return nil, err
-				}
-				if _, ok := keys[string(key.Marshal())]; !ok {
-					return nil, fmt.Errorf("unknown public key on hub")
-				}
-			}
-
-			// Verify with backend in real-time during the handshake:
-			if backend.Mode == "reverse" {
-				if err := s.verifyBackendAgentKey(backend, targetUser, key); err != nil {
-					return nil, fmt.Errorf("unauthorized key for backend %s", backendID)
-				}
-			} else if s.cfg.AuthorizedKeys != "" {
-				if err := s.verifyDirectBackendKey(targetUser, key); err != nil {
-					return nil, fmt.Errorf("unauthorized key for backend %s: %w", backendID, err)
-				}
+			// Delegate authorization to the backend agent in real time.
+			if err := s.verifyBackendAgentKey(backend, targetUser, key); err != nil {
+				return nil, fmt.Errorf("unauthorized key for backend %s", backendID)
 			}
 
 			return &ssh.Permissions{
@@ -88,14 +91,10 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 				},
 			}, nil
 		},
-		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			return &ssh.Permissions{
-				Extensions: map[string]string{
-					"user":     conn.User(),
-					"password": string(password),
-				},
-			}, nil
-		},
+
+		// NOTE: PasswordCallback is intentionally NOT set. The hub does not accept
+		// password authentication under any circumstances. (A permissive password
+		// callback was the root cause of the 2026-08 compromise.)
 	}
 
 	sshConfig.AddHostKey(hostKey)
@@ -104,52 +103,12 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 	return s, nil
 }
 
-// verifyDirectBackendKey checks if the public key is authorized in local authorized_keys files.
-func (s *Server) verifyDirectBackendKey(targetUser string, key ssh.PublicKey) error {
-	if s.cfg.AuthorizedKeys != "" {
-		keys, err := loadAuthorizedKeys(s.cfg.AuthorizedKeys)
-		if err != nil {
-			return err
-		}
-		if _, ok := keys[string(key.Marshal())]; ok {
-			return nil
-		}
-		return fmt.Errorf("key not found in configured authorized_keys")
-	}
-
-	paths := []string{
-		"/root/.ssh/authorized_keys",
-		"/root/.ssh/authorized_keys2",
-	}
-	if targetUser != "" && targetUser != "root" {
-		paths = append(paths,
-			fmt.Sprintf("/home/%s/.ssh/authorized_keys", targetUser),
-			fmt.Sprintf("/home/%s/.ssh/authorized_keys2", targetUser),
-		)
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths,
-			filepath.Join(home, ".ssh", "authorized_keys"),
-			filepath.Join(home, ".ssh", "authorized_keys2"),
-		)
-	}
-
-	for _, p := range paths {
-		if data, err := os.ReadFile(p); err == nil {
-			for len(data) > 0 {
-				authedKey, _, _, rest, err := ssh.ParseAuthorizedKey(data)
-				if err == nil && string(authedKey.Marshal()) == string(key.Marshal()) {
-					return nil
-				}
-				data = rest
-			}
-		}
-	}
-
-	return fmt.Errorf("key %s not found in local authorized_keys for user %s", ssh.FingerprintSHA256(key), targetUser)
-}
-
-// verifyBackendAgentKey validates the client's public key with the backend agent during the handshake.
+// verifyBackendAgentKey validates the client's public key with the backend agent
+// during the handshake. It opens a throwaway connection to the agent and offers
+// the client's public key (as the agent's key-in-password protocol expects); the
+// agent checks it against the backend's authorized_keys and accepts or rejects.
+//
+// The hub supplies ONLY the client's key here — never a hub-held credential.
 func (s *Server) verifyBackendAgentKey(backend *config.Backend, targetUser string, key ssh.PublicKey) error {
 	rawConn, err := s.dialBackend(backend)
 	if err != nil {
@@ -167,10 +126,8 @@ func (s *Server) verifyBackendAgentKey(backend *config.Backend, targetUser strin
 
 	pubkeyStr := string(ssh.MarshalAuthorizedKey(key))
 	clientConfig := &ssh.ClientConfig{
-		User: user,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(pubkeyStr),
-		},
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.Password(pubkeyStr)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
@@ -224,7 +181,6 @@ func (s *Server) Handle(conn net.Conn) {
 	}
 	defer serverConn.Close()
 
-	// Discard global out-of-band requests.
 	go ssh.DiscardRequests(reqs)
 
 	for newCh := range chans {
@@ -232,66 +188,24 @@ func (s *Server) Handle(conn net.Conn) {
 	}
 }
 
-// handleChannel processes channel requests (direct-tcpip or session).
+// handleChannel processes channel requests.
+//
+// Both zero-arg sessions ("session") and ProxyJump ("direct-tcpip") are routed to
+// the same agent-backed backend. In all cases the client was already authenticated
+// by public key and authorized by the agent during the handshake.
 func (s *Server) handleChannel(serverConn *ssh.ServerConn, newCh ssh.NewChannel) {
 	switch newCh.ChannelType() {
-	case "direct-tcpip":
-		s.handleDirectTCPIP(serverConn, newCh)
 	case "session":
 		s.handleSession(serverConn, newCh)
+	case "direct-tcpip":
+		s.handleDirectTCPIP(serverConn, newCh)
 	default:
 		newCh.Reject(ssh.UnknownChannelType, fmt.Sprintf("unsupported channel type: %s", newCh.ChannelType()))
 	}
 }
 
-type directTCPIPPayload struct {
-	DestAddr   string
-	DestPort   uint32
-	OriginAddr string
-	OriginPort uint32
-}
-
-func (s *Server) handleDirectTCPIP(serverConn *ssh.ServerConn, newCh ssh.NewChannel) {
-	var payload directTCPIPPayload
-	if err := ssh.Unmarshal(newCh.ExtraData(), &payload); err != nil {
-		newCh.Reject(ssh.ConnectionFailed, "invalid direct-tcpip payload")
-		return
-	}
-
-	backendID, _ := s.resolveBackendAndUser(serverConn.User(), payload.DestAddr)
-	if backendID == "" {
-		log.Printf("ssh: direct-tcpip: no route for user %q dest %q", serverConn.User(), payload.DestAddr)
-		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("no route to host %s", payload.DestAddr))
-		return
-	}
-
-	backend := s.cfg.BackendByID(backendID)
-	if backend == nil {
-		log.Printf("ssh: backend %q not found", backendID)
-		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("backend %q not found", backendID))
-		return
-	}
-
-	backendConn, err := s.dialBackend(backend)
-	if err != nil {
-		log.Printf("ssh: connect to backend %q: %v", backendID, err)
-		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("connect to backend %q: %v", backendID, err))
-		return
-	}
-
-	ch, reqs, err := newCh.Accept()
-	if err != nil {
-		backendConn.Close()
-		return
-	}
-	go ssh.DiscardRequests(reqs)
-
-	log.Printf("ssh: direct-tcpip %s -> backend %q (dest %s)", serverConn.RemoteAddr(), backendID, payload.DestAddr)
-	bridge(ch, backendConn)
-}
-
 func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel) {
-	backendID, targetUser := s.resolveBackendAndUser(serverConn.User(), "")
+	backendID, targetUser := s.resolveBackendAndUser(serverConn.User())
 	if backendID == "" {
 		log.Printf("ssh: no route for user %q", serverConn.User())
 		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("sshhub: no route for user %q", serverConn.User()))
@@ -305,7 +219,8 @@ func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 		return
 	}
 
-	// Dial the backend agent and pass the client's verified public key for session creation
+	// Open an authenticated connection to the agent, passing ONLY the client's
+	// verified public key (never a hub-held credential).
 	backendConn, backendChans, backendReqs, err := s.dialBackendAgent(backend, targetUser, serverConn.Permissions)
 	if err != nil {
 		log.Printf("ssh: backend %q auth failed for user %q: %v", backendID, targetUser, err)
@@ -332,7 +247,6 @@ func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 
 	log.Printf("ssh: session %s -> backend %q (user %q)", serverConn.RemoteAddr(), backendID, targetUser)
 
-	// Forward client requests to backend (pty-req, shell, exec, window-change, env, subsystem, etc.)
 	go func() {
 		for req := range clientReqs {
 			ok, err := backendCh.SendRequest(req.Type, req.WantReply, req.Payload)
@@ -342,7 +256,6 @@ func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 		}
 	}()
 
-	// Forward backend requests to client (exit-status, exit-signal, etc.)
 	var breqsWg sync.WaitGroup
 	breqsWg.Add(1)
 	go func() {
@@ -355,7 +268,6 @@ func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 		}
 	}()
 
-	// Forward any backend-initiated reverse channels
 	go func() {
 		for bNewCh := range backendChans {
 			forwardBackendChannel(bNewCh, serverConn)
@@ -372,6 +284,55 @@ func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 	backendCh.Close()
 	breqsWg.Wait()
 	clientCh.Close()
+}
+
+type directTCPIPPayload struct {
+	DestAddr   string
+	DestPort   uint32
+	OriginAddr string
+	OriginPort uint32
+}
+
+// handleDirectTCPIP supports ProxyJump (ssh -J hub target). The client was already
+// authenticated by public key and authorized by the agent during the handshake.
+// The raw stream is spliced to the agent's tunnel; the client may then run its own
+// end-to-end SSH handshake with the backend if it wishes.
+func (s *Server) handleDirectTCPIP(serverConn *ssh.ServerConn, newCh ssh.NewChannel) {
+	var payload directTCPIPPayload
+	if err := ssh.Unmarshal(newCh.ExtraData(), &payload); err != nil {
+		newCh.Reject(ssh.ConnectionFailed, "invalid direct-tcpip payload")
+		return
+	}
+
+	backendID, _ := s.resolveBackendAndUserHint(serverConn.User(), payload.DestAddr)
+	if backendID == "" {
+		log.Printf("ssh: direct-tcpip: no route for user %q dest %q", serverConn.User(), payload.DestAddr)
+		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("no route to host %s", payload.DestAddr))
+		return
+	}
+
+	backend := s.cfg.BackendByID(backendID)
+	if backend == nil {
+		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("backend %q not found", backendID))
+		return
+	}
+
+	backendConn, err := s.dialBackend(backend)
+	if err != nil {
+		log.Printf("ssh: connect to backend %q: %v", backendID, err)
+		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("connect to backend %q: %v", backendID, err))
+		return
+	}
+
+	ch, reqs, err := newCh.Accept()
+	if err != nil {
+		backendConn.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+
+	log.Printf("ssh: direct-tcpip %s -> backend %q (dest %s)", serverConn.RemoteAddr(), backendID, payload.DestAddr)
+	bridge(ch, backendConn)
 }
 
 func forwardBackendChannel(ch ssh.NewChannel, client *ssh.ServerConn) {
@@ -420,15 +381,15 @@ func forwardBackendChannel(ch ssh.NewChannel, client *ssh.ServerConn) {
 	cch.Close()
 }
 
-// dialBackend opens a raw network stream to the backend.
+// dialBackend opens a raw stream to the backend agent via the control plane.
+// Only reverse (agent) backends are supported; there is no direct mode.
 func (s *Server) dialBackend(backend *config.Backend) (net.Conn, error) {
-	if backend.Mode == "reverse" {
-		return s.registry.Open(context.Background(), backend.ID)
-	}
-	return net.Dial("tcp", backend.Address)
+	return s.registry.Open(context.Background(), backend.ID)
 }
 
-// dialBackendAgent opens a connection to the backend and passes proper authentication for authorization.
+// dialBackendAgent opens an authenticated SSH connection to the backend agent,
+// passing ONLY the client's verified public key for authorization. The hub never
+// contributes a credential of its own.
 func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, perms *ssh.Permissions) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	rawConn, err := s.dialBackend(backend)
 	if err != nil {
@@ -444,17 +405,14 @@ func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, pe
 	}
 
 	var auth []ssh.AuthMethod
-	if backend.Mode == "reverse" {
-		if perms != nil && perms.Extensions != nil {
-			if pubkey := perms.Extensions["pubkey"]; pubkey != "" {
-				auth = append(auth, ssh.Password(pubkey))
-			} else if password := perms.Extensions["password"]; password != "" {
-				auth = append(auth, ssh.Password(password))
-			}
+	if perms != nil && perms.Extensions != nil {
+		if pubkey := perms.Extensions["pubkey"]; pubkey != "" {
+			auth = append(auth, ssh.Password(pubkey))
 		}
-	} else {
-		// Mode == "direct": use direct auth methods (configured key, gateway host key, or forwarded password)
-		auth = s.buildDirectAuthMethods(backend, perms)
+	}
+	if len(auth) == 0 {
+		rawConn.Close()
+		return nil, nil, nil, fmt.Errorf("no client public key available for backend authorization")
 	}
 
 	clientConfig := &ssh.ClientConfig{
@@ -466,66 +424,14 @@ func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, pe
 	return ssh.NewClientConn(rawConn, backend.ID, clientConfig)
 }
 
-func (s *Server) buildDirectAuthMethods(backend *config.Backend, perms *ssh.Permissions) []ssh.AuthMethod {
-	var methods []ssh.AuthMethod
-
-	// 1. Explicit backend.Auth config
-	if backend.Auth != nil {
-		if backend.Auth.Password != "" {
-			methods = append(methods, ssh.Password(backend.Auth.Password))
-		}
-		if backend.Auth.PrivateKey != "" {
-			if signer, err := ssh.ParsePrivateKey([]byte(backend.Auth.PrivateKey)); err == nil {
-				methods = append(methods, ssh.PublicKeys(signer))
-			}
-		}
-		if backend.Auth.PrivateKeyFile != "" {
-			if data, err := os.ReadFile(backend.Auth.PrivateKeyFile); err == nil {
-				if signer, err := ssh.ParsePrivateKey(data); err == nil {
-					methods = append(methods, ssh.PublicKeys(signer))
-				}
-			}
-		}
-	}
-
-	// 2. Client forwarded password (if client authenticated with password)
-	if perms != nil && perms.Extensions != nil {
-		if pass := perms.Extensions["password"]; pass != "" {
-			methods = append(methods, ssh.Password(pass))
-		}
-	}
-
-	// 3. Gateway Host Key & Default private keys (~/.ssh/id_ed25519, ~/.ssh/id_rsa, /root/.ssh/...)
-	keyCandidates := []string{
-		s.cfg.HostKey,
-		"/root/.ssh/id_ed25519",
-		"/root/.ssh/id_rsa",
-		"/root/.ssh/id_ecdsa",
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		keyCandidates = append(keyCandidates,
-			filepath.Join(home, ".ssh", "id_ed25519"),
-			filepath.Join(home, ".ssh", "id_rsa"),
-		)
-	}
-
-	for _, kpath := range keyCandidates {
-		if kpath == "" {
-			continue
-		}
-		if data, err := os.ReadFile(kpath); err == nil {
-			if signer, err := ssh.ParsePrivateKey(data); err == nil {
-				methods = append(methods, ssh.PublicKeys(signer))
-			}
-		}
-	}
-
-	return methods
+// resolveBackendAndUser resolves the target backend and backend username from the
+// client's login username (e.g. "cidev", "root@cidev", "nuc").
+func (s *Server) resolveBackendAndUser(loginUser string) (string, string) {
+	return s.resolveBackendAndUserHint(loginUser, "")
 }
 
-// resolveBackendAndUser extracts the target backend ID and the backend username from
-// the client's login username and/or extra hint (such as direct-tcpip DestAddr).
-func (s *Server) resolveBackendAndUser(loginUser, hint string) (string, string) {
+// resolveBackendAndUserHint additionally considers a ProxyJump destination hint.
+func (s *Server) resolveBackendAndUserHint(loginUser, hint string) (string, string) {
 	req := routing.ParseRequest(loginUser)
 	hint = strings.TrimSpace(hint)
 
@@ -548,11 +454,9 @@ func (s *Server) resolveBackendAndUser(loginUser, hint string) (string, string) 
 		if id, ok := s.router.Resolve(req); ok {
 			return id, s.effectiveBackendUser(id, req.Username)
 		}
-
 		if id, ok := s.router.Resolve(routing.Request{Username: "*", Hostname: host}); ok {
 			return id, s.effectiveBackendUser(id, req.Username)
 		}
-
 		if b := s.cfg.BackendByID(host); b != nil {
 			return b.ID, s.effectiveBackendUser(b.ID, req.Username)
 		}
@@ -567,17 +471,12 @@ func (s *Server) resolveBackendAndUser(loginUser, hint string) (string, string) 
 		}
 	}
 
-	// 1. Check if login username directly matches a backend ID (e.g. ssh cidev@hub)
 	if b := s.cfg.BackendByID(req.Username); b != nil {
 		return b.ID, s.effectiveBackendUser(b.ID, "")
 	}
-
-	// 2. Check if login username matches a hostname route (e.g. ssh nuc@hub -> matches hostname: nuc)
 	if id, ok := s.router.Resolve(routing.Request{Username: "*", Hostname: req.Username}); ok {
 		return id, s.effectiveBackendUser(id, "")
 	}
-
-	// 3. Check regular user routes / catch-all
 	if id, ok := s.router.Resolve(req); ok {
 		return id, s.effectiveBackendUser(id, req.Username)
 	}
@@ -595,6 +494,7 @@ func (s *Server) effectiveBackendUser(backendID, clientUser string) string {
 	}
 	return "root"
 }
+
 
 // bridge copies bytes bidirectionally between two streams.
 func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser) {
@@ -624,10 +524,6 @@ func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser) {
 }
 
 func loadHostKey(path string) (ssh.Signer, error) {
-	return loadSigner(path)
-}
-
-func loadSigner(path string) (ssh.Signer, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read key %s: %w", path, err)
@@ -637,33 +533,4 @@ func loadSigner(path string) (ssh.Signer, error) {
 		return nil, fmt.Errorf("parse key %s: %w", path, err)
 	}
 	return signer, nil
-}
-
-// loadAuthorizedKeys returns the set of authorized public keys, keyed by their
-// marshaled form.
-func loadAuthorizedKeys(path string) (map[string]struct{}, error) {
-	if path == "" {
-		return nil, fmt.Errorf("authorized_keys is required")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read authorized_keys: %w", err)
-	}
-	keys := make(map[string]struct{})
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
-		if err != nil {
-			log.Printf("warning: skipping unparsable authorized_keys line: %v", err)
-			continue
-		}
-		keys[string(key.Marshal())] = struct{}{}
-	}
-	if len(keys) == 0 {
-		return nil, fmt.Errorf("no valid keys in authorized_keys")
-	}
-	return keys, nil
 }

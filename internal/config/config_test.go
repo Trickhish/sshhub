@@ -16,8 +16,8 @@ listen:
 host_key: "/tmp/key"
 backends:
   - id: web1
-    mode: direct
-    address: "10.0.0.10:22"
+    mode: reverse
+    token: "token-web1"
   - id: db1
     mode: reverse
     token: "token-db1"
@@ -61,6 +61,13 @@ func TestValidateErrors(t *testing.T) {
 			HostKey: "/k",
 			Backends: []Backend{
 				{ID: "b", Mode: "bogus"},
+			},
+		}},
+		{"direct mode rejected", Config{
+			Listen:  Listen{SSH: ":22", Control: ":7000"},
+			HostKey: "/k",
+			Backends: []Backend{
+				{ID: "b", Mode: "direct", Address: "10.0.0.1:22"},
 			},
 		}},
 		{"duplicate backend", Config{
