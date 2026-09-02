@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Trickhish/sshhub/internal/config"
+	"github.com/Trickhish/sshhub/internal/hubtls"
 	"github.com/Trickhish/sshhub/internal/hubupdate"
 	"github.com/Trickhish/sshhub/internal/version"
 )
@@ -128,17 +129,26 @@ func main() {
 			}
 		}
 
+		// The agent must pin the hub's key, otherwise its token is exposed to
+		// anyone on-path. Surface the pin here so the install command is
+		// complete and correct by construction.
+		pin := controlPlanePin(cfgPath)
+
 		fmt.Println()
 		fmt.Printf("✓ Backend %q successfully registered in %s\n", id, cfgPath)
 		fmt.Println()
 		fmt.Println("Generated Token:")
 		fmt.Printf("  %s\n", token)
 		fmt.Println()
+		fmt.Println("Hub Key Pin:")
+		fmt.Printf("  %s\n", pin)
+		fmt.Println()
 		fmt.Printf("1-Line Agent Install Command (run on node %q):\n", id)
-		fmt.Printf("  curl -sSL %s | sudo bash -s -- --hub %s --token %q\n", repoRawURL, hub, token)
+		fmt.Printf("  curl -sSL %s | sudo bash -s -- --hub %s --token %q --hub-pin %q\n",
+			repoRawURL, hub, token, pin)
 		fmt.Println()
 		fmt.Printf("Manual binary command:\n")
-		fmt.Printf("  sshhub-agent --hub %s --token %q\n", hub, token)
+		fmt.Printf("  sshhub-agent --hub %s --token %q --hub-pin %q\n", hub, token, pin)
 		fmt.Println()
 		fmt.Println("To connect from your client:")
 		fmt.Printf("  ssh %s@%s\n", id, domain)
@@ -275,6 +285,18 @@ func main() {
 		_ = exec.Command("systemctl", "try-restart", "sshhub").Run()
 		fmt.Printf("✓ SSHub Gateway successfully updated to %s!\n", verToInstall)
 
+	case "pin":
+		cfgPath := defaultConfigPath()
+		for i := 2; i < len(os.Args); i++ {
+			if os.Args[i] == "--config" && i+1 < len(os.Args) {
+				cfgPath = os.Args[i+1]
+				i++
+			} else if strings.HasPrefix(os.Args[i], "--config=") {
+				cfgPath = strings.TrimPrefix(os.Args[i], "--config=")
+			}
+		}
+		fmt.Println(controlPlanePin(cfgPath))
+
 	case "version", "-v", "--version":
 		fmt.Printf("sshhub version %s\n", version.Version)
 
@@ -312,14 +334,37 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  add <id>     Add a new reverse backend, generate token, and update config")
 	fmt.Println("  remove <id>  Remove a backend and its routes from config")
-	fmt.Println("  list         List all configured backends and tokens")
+	fmt.Println("  list         List all configured backends and end users")
+	fmt.Println("  pin          Show the hub key pin agents must use (--hub-pin)")
 	fmt.Println("  update       Check for and apply updates from GitHub Releases")
 	fmt.Println("  version      Show current version")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  sshhub-ctl add worker1")
+	fmt.Println("  sshhub-ctl add worker1 --end-user deploy")
+	fmt.Println("  sshhub-ctl pin")
 	fmt.Println("  sshhub-ctl list")
 	fmt.Println("  sshhub-ctl update")
 	fmt.Println("  sshhub-ctl update --check")
 	fmt.Println("  sshhub-ctl remove worker1")
+}
+
+// controlPlanePin returns the hub's control-plane public key pin, which agents
+// need in order to authenticate the hub. Returns a placeholder if the
+// certificate is not present yet (the hub generates it on first start).
+func controlPlanePin(cfgPath string) string {
+	certPath := config.DefaultTLSCertPath
+	if cfg, err := config.Load(cfgPath); err == nil && cfg.TLSCert != "" {
+		certPath = cfg.TLSCert
+	}
+
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		return "<start the hub once to generate its certificate, then run: sshhub-ctl pin>"
+	}
+	pin, err := hubtls.FingerprintFromPEM(data)
+	if err != nil {
+		return "<unreadable certificate: " + err.Error() + ">"
+	}
+	return pin
 }

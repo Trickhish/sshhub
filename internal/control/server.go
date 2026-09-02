@@ -76,7 +76,14 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	s.registry.register(backend, session)
+	// A second agent presenting the same token must not silently displace or
+	// shadow the first: previously this error was discarded, so the hub logged
+	// "connected" for a session that was never in the registry.
+	if err := s.registry.register(backend, session); err != nil {
+		log.Printf("control: refusing registration for %q: %v", backend, err)
+		session.Close()
+		return
+	}
 	log.Printf("backend %q connected", backend)
 
 	// Remove the backend when the session drops.

@@ -123,6 +123,13 @@ func (r Route) MarshalYAML() (interface{}, error) {
 // does not specify end_user.
 const DefaultEndUser = "root"
 
+// Default paths for the hub's self-signed control-plane certificate, used when
+// the operator has not supplied one. The control listener is always TLS.
+const (
+	DefaultTLSCertPath = "/etc/sshhub/control-cert.pem"
+	DefaultTLSKeyPath  = "/etc/sshhub/control-key.pem"
+)
+
 // ResolvedEndUser returns the Unix account this route's sessions run as.
 func (r Route) ResolvedEndUser() string {
 	if r.EndUser != "" {

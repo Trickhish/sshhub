@@ -8,6 +8,8 @@ SERVICE_FILE="/etc/systemd/system/sshhub-agent.service"
 
 HUB=""
 TOKEN=""
+HUB_PIN=""
+INSECURE_NO_PIN=""
 SSHD=""
 REBUILD=false
 VERSION="latest"
@@ -50,6 +52,14 @@ while [[ $# -gt 0 ]]; do
       TOKEN="$2"
       shift 2
       ;;
+    --hub-pin)
+      HUB_PIN="$2"
+      shift 2
+      ;;
+    --insecure-no-pin)
+      INSECURE_NO_PIN="1"
+      shift
+      ;;
     --sshd)
       SSHD="$2"
       shift 2
@@ -87,6 +97,9 @@ if [[ -f "$SERVICE_FILE" ]]; then
   if [[ -z "$TOKEN" ]]; then
     TOKEN="$(extract_flag "token" "$SERVICE_FILE")"
   fi
+  if [[ -z "$HUB_PIN" ]]; then
+    HUB_PIN="$(extract_flag "hub-pin" "$SERVICE_FILE")"
+  fi
   if [[ -z "$SSHD" ]]; then
     SSHD="$(extract_flag "sshd" "$SERVICE_FILE")"
   fi
@@ -104,6 +117,10 @@ if [[ -z "$TOKEN" && -t 0 ]]; then
   read -rp "Enter Agent registration token: " TOKEN
 fi
 
+if [[ -z "$HUB_PIN" && -z "$INSECURE_NO_PIN" && -t 0 ]]; then
+  read -rp "Enter Hub key pin (run 'sshhub-ctl pin' on the hub): " HUB_PIN
+fi
+
 # If still missing, fail with a clear error
 if [[ -z "$HUB" ]]; then
   echo "Error: Hub address is required. Specify with --hub <hub-host:7000>" >&2
@@ -112,6 +129,15 @@ fi
 
 if [[ -z "$TOKEN" ]]; then
   echo "Error: Registration token is required. Specify with --token <token>" >&2
+  exit 1
+fi
+
+# The control connection carries the token, which is this agent's only
+# credential. Without a pin an on-path attacker can capture it, so refuse
+# rather than silently connecting unauthenticated.
+if [[ -z "$HUB_PIN" && -z "$INSECURE_NO_PIN" ]]; then
+  echo "Error: Hub key pin is required. Run 'sshhub-ctl pin' on the hub and pass --hub-pin <pin>." >&2
+  echo "       (Use --insecure-no-pin only for local testing; it exposes your token.)" >&2
   exit 1
 fi
 
@@ -205,6 +231,12 @@ chmod +x "${INSTALL_DIR}/sshhub-agent"
 
 # 6. Create or update Systemd Service
 EXEC_CMD="${INSTALL_DIR}/sshhub-agent --hub ${HUB} --token ${TOKEN}"
+if [[ -n "$HUB_PIN" ]]; then
+  EXEC_CMD="${EXEC_CMD} --hub-pin ${HUB_PIN}"
+fi
+if [[ -n "$INSECURE_NO_PIN" ]]; then
+  EXEC_CMD="${EXEC_CMD} --insecure-no-pin"
+fi
 if [[ -n "$SSHD" ]]; then
   EXEC_CMD="${EXEC_CMD} --sshd ${SSHD}"
 fi

@@ -4,8 +4,10 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"slices"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/Trickhish/sshhub/internal/config"
 	"github.com/Trickhish/sshhub/internal/control"
+	"github.com/Trickhish/sshhub/internal/hubtls"
 	"github.com/Trickhish/sshhub/internal/hubupdate"
 	"github.com/Trickhish/sshhub/internal/proxy"
 )
@@ -76,13 +79,41 @@ func main() {
 	cancel()
 }
 
+// controlTLS returns the TLS configuration for the control listener.
+//
+// TLS is ALWAYS enabled. The control plane carries agent registration tokens,
+// which are an agent's only credential; it previously defaulted to plaintext on
+// a public port, so anyone on-path could capture a token and register as that
+// backend. If no certificate is configured a self-signed one is generated and
+// persisted, and agents authenticate the hub by public key pin.
 func controlTLS(cfg *config.Config) *tls.Config {
-	if cfg.TLSCert == "" || cfg.TLSKey == "" {
-		return nil
+	certPath, keyPath := cfg.TLSCert, cfg.TLSKey
+	if certPath == "" || keyPath == "" {
+		certPath = config.DefaultTLSCertPath
+		keyPath = config.DefaultTLSKeyPath
+		log.Printf("tls: no certificate configured; using self-signed at %s", certPath)
 	}
-	cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+
+	var hosts []string
+	if cfg.PublicHost != "" {
+		host := cfg.PublicHost
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		hosts = append(hosts, host)
+	}
+	if h, err := os.Hostname(); err == nil && h != "" {
+		hosts = append(hosts, h)
+	}
+
+	cert, err := hubtls.LoadOrCreate(certPath, keyPath, hosts)
 	if err != nil {
 		log.Fatalf("tls: %v", err)
 	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+		log.Printf("control plane key pin: %s", hubtls.Fingerprint(leaf))
+	}
+
+	return hubtls.ServerConfig(cert)
 }
