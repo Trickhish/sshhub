@@ -5,20 +5,64 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
+// DefaultAutoUpdateWait is how long a release must have been public before the
+// hub installs it automatically. It is a soak period: the updater is how a bad
+// release reaches production unattended, so this gives one time to be noticed
+// and replaced first. Set auto_update_wait to 0 to update as soon as a release
+// appears.
+const DefaultAutoUpdateWait = 48 * time.Hour
+
+// autoUpdateWaitValue holds the raw auto_update_wait scalar.
+//
+// YAML types `false` as a bool and `0`/`48` as ints, so a plain string field
+// would fail to unmarshal the most natural spellings. This accepts any scalar
+// and keeps its text for parseAutoUpdateWait to interpret.
+type autoUpdateWaitValue struct {
+	raw string
+}
+
+func (v *autoUpdateWaitValue) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("auto_update_wait must be a single value, e.g. \"48h\", \"0\", or false")
+	}
+	v.raw = node.Value
+	return nil
+}
+
+func (v autoUpdateWaitValue) MarshalYAML() (interface{}, error) {
+	return v.raw, nil
+}
+
+// String returns the configured value as written.
+func (v autoUpdateWaitValue) String() string { return v.raw }
+
 // Config is the top-level sshhub hub configuration.
 type Config struct {
-	Listen        Listen    `yaml:"listen"`
-	PublicHost    string    `yaml:"public_host,omitempty"`
-	HostKey       string    `yaml:"host_key"`
-	TLSCert       string    `yaml:"tls_cert,omitempty"`
-	TLSKey        string    `yaml:"tls_key,omitempty"`
-	ControlTokens []string  `yaml:"control_tokens,omitempty"`
-	Backends      []Backend `yaml:"backends"`
-	Routes        []Route   `yaml:"routes"`
+	Listen     Listen `yaml:"listen"`
+	PublicHost string `yaml:"public_host,omitempty"`
+	// AutoUpdateWait is how long a release must be public before it installs:
+	// a duration ("48h"), "0" to install immediately, or "false" to disable
+	// automatic updates.
+	//
+	// A pointer so an explicit value is distinguishable from an absent field
+	// (which means DefaultAutoUpdateWait). With a plain string, omitting the
+	// field would be indistinguishable from setting it to "", and would
+	// silently change behaviour.
+	//
+	// Typed as *autoUpdateWaitValue so unquoted YAML scalars parse: `false` and
+	// `0` are a bool and an int to the YAML parser, not strings.
+	AutoUpdateWait *autoUpdateWaitValue `yaml:"auto_update_wait,omitempty"`
+	HostKey        string               `yaml:"host_key"`
+	TLSCert        string               `yaml:"tls_cert,omitempty"`
+	TLSKey         string               `yaml:"tls_key,omitempty"`
+	ControlTokens  []string             `yaml:"control_tokens,omitempty"`
+	Backends       []Backend            `yaml:"backends"`
+	Routes         []Route              `yaml:"routes"`
 }
 
 // Listen holds the addresses the hub binds to.
@@ -176,6 +220,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one backend is required")
 	}
 
+	// Reject rather than silently defaulting: a typo here would quietly restore
+	// the 48h wait on a hub the operator believes updates instantly, or vice
+	// versa.
+	if c.AutoUpdateWait != nil {
+		if _, err := parseAutoUpdateWait(c.AutoUpdateWait.raw); err != nil {
+			return fmt.Errorf("auto_update_wait: %w", err)
+		}
+	}
+
 	seen := make(map[string]bool)
 	seenTokens := make(map[string]string)
 	for i := range c.Backends {
@@ -247,6 +300,69 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// ResolvedAutoUpdateWait returns the configured update soak period, or
+// DefaultAutoUpdateWait when the field is absent. It returns
+// AutoUpdateDisabled when automatic updates are switched off.
+//
+// Validate rejects an unparsable value, so this cannot silently fall back to
+// the default because of a typo.
+func (c *Config) ResolvedAutoUpdateWait() time.Duration {
+	if c.AutoUpdateWait == nil {
+		return DefaultAutoUpdateWait
+	}
+	d, err := parseAutoUpdateWait(c.AutoUpdateWait.raw)
+	if err != nil {
+		return DefaultAutoUpdateWait
+	}
+	return d
+}
+
+// AutoUpdateDisabled is the sentinel returned when automatic updates are
+// switched off entirely. It is distinct from 0, which means "install
+// immediately".
+const AutoUpdateDisabled = time.Duration(-1)
+
+// parseAutoUpdateWait parses a soak period.
+//
+// Accepted: Go durations ("48h", "90m"), "0" for no wait, and
+// false/no/off/never/disabled to switch automatic updates off.
+//
+// Deliberately NOT accepted:
+//
+//   - an empty value. "auto_update_wait:" with nothing after it is a natural
+//     way to write "unset", but it is equally readable as "disabled". Rather
+//     than pick one it is rejected, because guessing wrong either leaves a hub
+//     updating when the operator meant to stop it, or stops updates on a hub
+//     the operator expects to be current.
+//   - "-1" and other negatives. A negative is more likely a typo in a duration
+//     than a deliberate request to disable, and silently disabling updates is
+//     the more dangerous reading.
+func parseAutoUpdateWait(s string) (time.Duration, error) {
+	raw := strings.TrimSpace(s)
+	switch strings.ToLower(raw) {
+	case "false", "no", "off", "never", "disabled":
+		return AutoUpdateDisabled, nil
+	}
+
+	if raw == "" {
+		return 0, fmt.Errorf("must not be empty; use \"0\" to update immediately, " +
+			"\"false\" to disable updates, or a duration such as \"48h\"")
+	}
+	if raw == "0" {
+		return 0, nil
+	}
+
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid value %q (expected a duration such as \"48h\" or \"90m\", "+
+			"\"0\" to update immediately, or \"false\" to disable updates)", raw)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("must not be negative, got %q; use \"false\" to disable updates", raw)
+	}
+	return d, nil
 }
 
 // BackendByID returns the backend with the given id, or nil.

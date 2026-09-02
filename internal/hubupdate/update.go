@@ -24,8 +24,9 @@ import (
 const githubRepo = "Trickhish/sshhub"
 
 type githubRelease struct {
-	TagName string        `json:"tag_name"`
-	Assets  []githubAsset `json:"assets"`
+	TagName     string        `json:"tag_name"`
+	PublishedAt time.Time     `json:"published_at"`
+	Assets      []githubAsset `json:"assets"`
 }
 
 type githubAsset struct {
@@ -107,6 +108,41 @@ func FetchLatestVersion() (string, error) {
 		return "", fmt.Errorf("decode release json: %w", err)
 	}
 	return rel.TagName, nil
+}
+
+// FetchLatestRelease returns the latest release's tag and publication time.
+//
+// Unlike FetchLatestVersion it always uses the GitHub API: the release redirect
+// carries only the tag, and the publication time is what the update soak period
+// is measured against.
+func FetchLatestRelease() (tag string, publishedAt time.Time, err error) {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
+	client := newHTTPClient(10 * time.Second)
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	req.Header.Set("User-Agent", "sshhub-updater")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("fetch latest release: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", time.Time{}, fmt.Errorf("github API returned HTTP %d", resp.StatusCode)
+	}
+
+	var rel githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return "", time.Time{}, fmt.Errorf("decode release json: %w", err)
+	}
+	if rel.TagName == "" {
+		return "", time.Time{}, fmt.Errorf("release has no tag")
+	}
+	return rel.TagName, rel.PublishedAt, nil
 }
 
 // IsNewer compares two semantic versions (e.g. "v0.3.0" > "0.2.0").
@@ -282,24 +318,101 @@ func replaceBinary(src, dst string) error {
 }
 
 // StartAutoUpdater runs a periodic background loop checking for GitHub releases.
-func StartAutoUpdater(interval time.Duration) {
+// StartAutoUpdater periodically checks for a newer release and applies it.
+//
+// soak is how long a release must have been public before it is installed. It
+// exists because the updater is the mechanism by which a bad release reaches
+// production unattended: a release that breaks the control plane deploys
+// itself, disconnects every agent, and (since the hub also fronts port 22) can
+// remove the operator's own way back in. A soak period gives a broken release
+// time to be noticed and replaced before it propagates.
+//
+// A soak of 0 means install as soon as a release is seen. A negative soak
+// (Disabled) switches automatic updates off entirely: no polling goroutine is
+// started, so the hub makes no outbound release requests at all.
+func StartAutoUpdater(interval, soak time.Duration) {
+	if soak < 0 {
+		return
+	}
 	go func() {
 		// Initial check 10 seconds after start
 		time.Sleep(10 * time.Second)
 		for {
-			if latest, err := FetchLatestVersion(); err == nil {
-				if IsNewer(latest, version.Version) {
-					log.Printf("hub: new version %s detected (current %s). Performing automatic update...", latest, version.Version)
-					if err := DownloadAndApplyHubUpdate(latest); err == nil {
-						log.Printf("hub: update applied. Restarting sshhub service...")
-						_ = exec.Command("systemctl", "restart", "sshhub").Run()
-						return
-					} else {
-						log.Printf("hub: automatic update failed: %v", err)
-					}
-				}
+			if applyIfDue(soak) {
+				return
 			}
 			time.Sleep(interval)
 		}
 	}()
+}
+
+// updateChecker resolves the current latest release. Injectable for tests.
+type updateChecker func(soak time.Duration) (tag string, publishedAt time.Time, err error)
+
+// updateInstaller applies a release. Injectable for tests.
+type updateInstaller func(tag string) error
+
+func defaultChecker(soak time.Duration) (string, time.Time, error) {
+	// With no soak period the tag alone is enough, so the cheap redirect path
+	// is fine. Otherwise the publication time is required.
+	if soak <= 0 {
+		tag, err := FetchLatestVersion()
+		return tag, time.Time{}, err
+	}
+	return FetchLatestRelease()
+}
+
+// applyIfDue performs one check. It reports whether an update was applied and
+// the service is restarting.
+//
+// Each call re-resolves the CURRENT latest release rather than remembering the
+// one that started the wait. So if a release turns out to be broken and is
+// replaced during its soak period, the replacement is what eventually installs
+// -- an emergency fix is picked up instead of the release it fixes.
+func applyIfDue(soak time.Duration) bool {
+	return applyIfDueWith(soak, defaultChecker, DownloadAndApplyHubUpdate, currentVersion)
+}
+
+func currentVersion() string { return version.Version }
+
+func applyIfDueWith(soak time.Duration, check updateChecker, install updateInstaller, current func() string) bool {
+	// Guarded here as well as in StartAutoUpdater, so a future caller that
+	// forgets the check cannot accidentally auto-update a hub whose operator
+	// disabled it.
+	if soak < 0 {
+		return false
+	}
+
+	latest, published, err := check(soak)
+	if err != nil {
+		return false
+	}
+
+	if !IsNewer(latest, current()) {
+		return false
+	}
+
+	if soak > 0 {
+		if published.IsZero() {
+			// Fail closed: without a publication time the soak period cannot be
+			// honoured, and installing anyway would silently defeat it.
+			log.Printf("hub: release %s has no publication time; deferring update", latest)
+			return false
+		}
+		if age := time.Since(published); age < soak {
+			log.Printf("hub: release %s is %s old, waiting until it is %s old before updating",
+				latest, age.Round(time.Minute), soak)
+			return false
+		}
+	}
+
+	log.Printf("hub: new version %s detected (current %s). Performing automatic update...", latest, current())
+	if err := install(latest); err != nil {
+		log.Printf("hub: automatic update failed: %v", err)
+		return false
+	}
+
+	log.Printf("hub: update applied. Restarting sshhub service...")
+	_ = exec.Command("systemctl", "restart", "sshhub").Run()
+	return true
 }

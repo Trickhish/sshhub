@@ -276,6 +276,15 @@ public_host: "hub.example.com" # Public domain used in sshhub-ctl output
 
 host_key: "/etc/sshhub/ssh_host_ed25519_key"
 
+# How long a release must be public before the hub installs it automatically.
+#   48h      wait two days (default when omitted) -- a soak period, so a bad
+#            release has time to be noticed and replaced before it propagates
+#   0        install as soon as a release appears
+#   false    disable automatic updates entirely (update with 'sshhub-ctl update')
+# The newest release at the end of the wait is what installs, so an emergency
+# fix supersedes the release it fixes rather than queueing behind it.
+# auto_update_wait: 48h
+
 # TLS for the control plane. If omitted, a self-signed certificate is
 # generated at /etc/sshhub/control-cert.pem on first start and agents pin it.
 # tls_cert: "/etc/sshhub/control-cert.pem"

@@ -70,7 +70,16 @@ func main() {
 	}()
 
 	// Start background auto-updater for the Hub gateway
-	hubupdate.StartAutoUpdater(6 * time.Hour)
+	wait := cfg.ResolvedAutoUpdateWait()
+	switch {
+	case wait == config.AutoUpdateDisabled:
+		log.Printf("auto-update: DISABLED (auto_update_wait: false); update manually with 'sshhub-ctl update'")
+	case wait == 0:
+		log.Printf("auto-update: releases install as soon as they appear (auto_update_wait: 0)")
+	default:
+		log.Printf("auto-update: releases install once %s old (auto_update_wait)", wait)
+	}
+	hubupdate.StartAutoUpdater(6*time.Hour, wait)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
