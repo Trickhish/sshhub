@@ -38,48 +38,16 @@ func NewAgentServer() (*AgentServer, error) {
 	}
 
 	sshConfig := &ssh.ServerConfig{
-		// PasswordCallback receives the client's public key string in the password field
-		// from the hub, and checks if it is in authorized_keys for the target user.
-		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			targetUser := conn.User()
-			if targetUser == "" {
-				targetUser = "root"
-			}
-
-			// Fail closed on an unknown account rather than falling back to root.
-			acct, err := lookupAccount(targetUser)
-			if err != nil {
-				log.Printf("agent: reject session: %v", err)
-				return nil, fmt.Errorf("unauthorized")
-			}
-
-			if isKeyAuthorized(acct, string(password)) {
-				return &ssh.Permissions{
-					Extensions: map[string]string{"user": acct.Name},
-				}, nil
-			}
-			return nil, fmt.Errorf("unauthorized")
-		},
-		// PublicKeyCallback also accepts direct public key authentication if connected directly.
-		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			targetUser := conn.User()
-			if targetUser == "" {
-				targetUser = "root"
-			}
-
-			acct, err := lookupAccount(targetUser)
-			if err != nil {
-				log.Printf("agent: reject session: %v", err)
-				return nil, fmt.Errorf("unauthorized")
-			}
-
-			if isKeyAuthorized(acct, string(ssh.MarshalAuthorizedKey(key))) {
-				return &ssh.Permissions{
-					Extensions: map[string]string{"user": acct.Name},
-				}, nil
-			}
-			return nil, fmt.Errorf("unauthorized")
-		},
+		// Authorization already happened in the stream header (see streamauth.go),
+		// on a channel only the hub can write to. The SSH layer here just carries
+		// the session; it performs no authentication of its own.
+		//
+		// PasswordCallback is intentionally ABSENT. It previously accepted the
+		// client's public key as a password, which made a published public key a
+		// bearer token: anyone who could reach the agent could present a victim's
+		// key and be let in. PublicKeyCallback is absent for the same reason --
+		// possession of a public key proves nothing.
+		NoClientAuth: true,
 	}
 	sshConfig.AddHostKey(signer)
 
@@ -103,13 +71,26 @@ func (a *AgentServer) ServeStreams(ctx context.Context, session *yamux.Session) 
 		go a.handleStream(stream)
 	}
 }
-
 func (a *AgentServer) handleStream(stream net.Conn) {
 	defer stream.Close()
 
+	// Authorize BEFORE any SSH machinery runs. The frame arrived on the control
+	// session this agent dialled out and authenticated, so it provably came from
+	// the hub.
+	acct, purpose, err := a.authorizeStream(stream)
+	if err != nil {
+		log.Printf("agent: %v", err)
+		return
+	}
+
+	// A verify probe only asks for the verdict; the hub closes the stream.
+	if purpose == PurposeVerify {
+		return
+	}
+
 	sConn, chans, reqs, err := ssh.NewServerConn(stream, a.sshConfig)
 	if err != nil {
-		log.Printf("agent: handshake check failed: %v", err)
+		log.Printf("agent: handshake failed: %v", err)
 		return
 	}
 	defer sConn.Close()
@@ -121,16 +102,6 @@ func (a *AgentServer) handleStream(stream net.Conn) {
 			newCh.Reject(ssh.UnknownChannelType, "only session channels supported")
 			continue
 		}
-		// Re-resolve from the authenticated identity. Failing here means the
-		// account vanished between auth and channel open; refuse rather than
-		// serve the session with an unresolved (and therefore root) identity.
-		acct, err := lookupAccount(sConn.User())
-		if err != nil {
-			log.Printf("agent: reject channel: %v", err)
-			newCh.Reject(ssh.Prohibited, "unauthorized")
-			continue
-		}
-
 		ch, chReqs, err := newCh.Accept()
 		if err != nil {
 			log.Printf("agent: accept channel: %v", err)
@@ -138,6 +109,39 @@ func (a *AgentServer) handleStream(stream net.Conn) {
 		}
 		go handleSessionChannel(ch, chReqs, acct)
 	}
+}
+
+// authorizeStream reads and validates the hub's authorization header.
+//
+// The agent is the authority here: it independently confirms the account exists
+// on THIS host and that the named key is in that account's authorized_keys. The
+// hub's assertion selects who to check, it does not decide the outcome.
+func (a *AgentServer) authorizeStream(stream net.Conn) (*account, string, error) {
+	req, err := AcceptSession(stream)
+	if err != nil {
+		return nil, "", fmt.Errorf("stream authorization: %w", err)
+	}
+
+	endUser := req.EndUser
+	if endUser == "" {
+		endUser = "root"
+	}
+
+	acct, err := lookupAccount(endUser)
+	if err != nil {
+		_ = ReplySession(stream, false, "unauthorized")
+		return nil, "", fmt.Errorf("reject session: %w", err)
+	}
+
+	if !isKeyAuthorized(acct, req.ClientKey) {
+		_ = ReplySession(stream, false, "unauthorized")
+		return nil, "", fmt.Errorf("reject session: key not authorized for account %q", acct.Name)
+	}
+
+	if err := ReplySession(stream, true, ""); err != nil {
+		return nil, "", fmt.Errorf("reply: %w", err)
+	}
+	return acct, req.Purpose, nil
 }
 
 type ptyReqPayload struct {

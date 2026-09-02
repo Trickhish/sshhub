@@ -113,38 +113,22 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 // agent checks it against the backend's authorized_keys and accepts or rejects.
 //
 // The hub supplies ONLY the client's key here — never a hub-held credential.
-func (s *Server) verifyBackendAgentKey(backend *config.Backend, targetUser string, key ssh.PublicKey) error {
+func (s *Server) verifyBackendAgentKey(backend *config.Backend, endUser string, key ssh.PublicKey) error {
 	rawConn, err := s.dialBackend(backend)
 	if err != nil {
 		return err
 	}
 	defer rawConn.Close()
 
-	user := targetUser
-	if user == "" {
-		user = backend.Username
-	}
-	if user == "" {
-		user = "root"
-	}
-
-	pubkeyStr := string(ssh.MarshalAuthorizedKey(key))
-	clientConfig := &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.Password(pubkeyStr)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-
-	agentConn, chans, reqs, err := ssh.NewClientConn(rawConn, backend.ID, clientConfig)
-	if err != nil {
-		return err
-	}
-	_ = agentConn.Close()
-	go ssh.DiscardRequests(reqs)
-	for ch := range chans {
-		ch.Reject(ssh.Prohibited, "auth check only")
-	}
-	return nil
+	// A header exchange, not a full SSH handshake: this runs inside the client's
+	// own handshake, so it must stay cheap. (The previous implementation opened
+	// a complete SSH connection per key offered, which a client with a large
+	// agent could amplify into many backend connections.)
+	return control.RequestSession(rawConn, control.SessionRequest{
+		Purpose:   control.PurposeVerify,
+		EndUser:   endUser,
+		ClientKey: string(ssh.MarshalAuthorizedKey(key)),
+	})
 }
 
 // Serve accepts SSH client connections until ctx is canceled.
@@ -408,37 +392,37 @@ func (s *Server) dialBackend(backend *config.Backend) (net.Conn, error) {
 	return s.registry.Open(context.Background(), backend.ID)
 }
 
-// dialBackendAgent opens an authenticated SSH connection to the backend agent,
-// passing ONLY the client's verified public key for authorization. The hub never
-// contributes a credential of its own.
-func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, perms *ssh.Permissions) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+// dialBackendAgent opens a session stream to the backend agent, authorized by
+// the framed stream header. The hub asserts which end user and which client key;
+// the agent independently verifies both. The hub contributes no credential of
+// its own, and the client's public key is never used as one.
+func (s *Server) dialBackendAgent(backend *config.Backend, endUser string, perms *ssh.Permissions) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+	clientKey := ""
+	if perms != nil && perms.Extensions != nil {
+		clientKey = perms.Extensions["pubkey"]
+	}
+	if clientKey == "" {
+		return nil, nil, nil, fmt.Errorf("no client public key recorded for authorization")
+	}
+
 	rawConn, err := s.dialBackend(backend)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	user := targetUser
-	if user == "" {
-		user = backend.Username
-	}
-	if user == "" {
-		user = "root"
-	}
-
-	var auth []ssh.AuthMethod
-	if perms != nil && perms.Extensions != nil {
-		if pubkey := perms.Extensions["pubkey"]; pubkey != "" {
-			auth = append(auth, ssh.Password(pubkey))
-		}
-	}
-	if len(auth) == 0 {
+	if err := control.RequestSession(rawConn, control.SessionRequest{
+		Purpose:   control.PurposeSession,
+		EndUser:   endUser,
+		ClientKey: clientKey,
+	}); err != nil {
 		rawConn.Close()
-		return nil, nil, nil, fmt.Errorf("no client public key available for backend authorization")
+		return nil, nil, nil, err
 	}
 
+	// Authorization is complete; this SSH layer only transports the session.
 	clientConfig := &ssh.ClientConfig{
-		User:            user,
-		Auth:            auth,
+		User:            endUser,
+		Auth:            []ssh.AuthMethod{},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 

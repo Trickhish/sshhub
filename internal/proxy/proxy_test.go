@@ -5,10 +5,10 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,33 +44,37 @@ func writeFile(t *testing.T, dir, name, content string) string {
 	return path
 }
 
-// stubAgent emulates sshhub-agent's auth contract: the hub connects and offers the
-// client's marshaled public key in the SSH password field; the agent authorizes it
-// against an allowlist and, on success, serves a trivial exec. It is served over
-// each accepted yamux stream, exactly like the real agent's ServeStreams.
+// stubAgent emulates sshhub-agent's authorization contract: the hub sends a
+// framed authorization header (see control/streamauth.go) naming the end user
+// and the client's public key, and the agent verifies it against an allowlist
+// before any SSH machinery runs.
+//
+// It deliberately reuses the REAL control.AcceptSession/ReplySession helpers, so
+// a change to the wire protocol breaks this test rather than silently passing
+// against a stale fake.
 type stubAgent struct {
-	cfg *ssh.ServerConfig
+	cfg     *ssh.ServerConfig
+	allowed string
+	// lastEndUser records the end user the hub asserted, so tests can check
+	// that the Unix account came from the route and not from client input.
+	mu          sync.Mutex
+	lastEndUser string
 }
 
 func newStubAgent(t *testing.T, allowed ssh.PublicKey) *stubAgent {
 	t.Helper()
 	hostSigner, _ := generateKey(t)
-	allowedMarshaled := string(allowed.Marshal())
 
-	cfg := &ssh.ServerConfig{
-		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			key, _, _, _, err := ssh.ParseAuthorizedKey(password)
-			if err != nil {
-				return nil, fmt.Errorf("bad key")
-			}
-			if string(key.Marshal()) != allowedMarshaled {
-				return nil, fmt.Errorf("unauthorized key")
-			}
-			return &ssh.Permissions{}, nil
-		},
-	}
+	// No client auth: authorization happened in the stream header.
+	cfg := &ssh.ServerConfig{NoClientAuth: true}
 	cfg.AddHostKey(hostSigner)
-	return &stubAgent{cfg: cfg}
+	return &stubAgent{cfg: cfg, allowed: string(allowed.Marshal())}
+}
+
+func (a *stubAgent) EndUser() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastEndUser
 }
 
 func (a *stubAgent) serveStreams(ctx context.Context, session *yamux.Session) {
@@ -84,6 +88,34 @@ func (a *stubAgent) serveStreams(ctx context.Context, session *yamux.Session) {
 }
 
 func (a *stubAgent) serve(conn net.Conn) {
+	// Authorize from the framed header before anything else.
+	req, err := control.AcceptSession(conn)
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	key, _, _, _, kerr := ssh.ParseAuthorizedKey([]byte(req.ClientKey))
+	if kerr != nil || string(key.Marshal()) != a.allowed {
+		_ = control.ReplySession(conn, false, "unauthorized")
+		conn.Close()
+		return
+	}
+	if err := control.ReplySession(conn, true, ""); err != nil {
+		conn.Close()
+		return
+	}
+
+	a.mu.Lock()
+	a.lastEndUser = req.EndUser
+	a.mu.Unlock()
+
+	// A verify probe ends here; the hub closes the stream.
+	if req.Purpose == control.PurposeVerify {
+		conn.Close()
+		return
+	}
+
 	sConn, chans, reqs, err := ssh.NewServerConn(conn, a.cfg)
 	if err != nil {
 		conn.Close()
