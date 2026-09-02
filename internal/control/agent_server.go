@@ -4,16 +4,16 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
-	"os/user"
-	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/creack/pty"
 	"github.com/hashicorp/yamux"
@@ -41,20 +41,24 @@ func NewAgentServer() (*AgentServer, error) {
 		// PasswordCallback receives the client's public key string in the password field
 		// from the hub, and checks if it is in authorized_keys for the target user.
 		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			clientKeyStr := string(password)
 			targetUser := conn.User()
 			if targetUser == "" {
 				targetUser = "root"
 			}
 
-			if isKeyAuthorized(targetUser, clientKeyStr) {
+			// Fail closed on an unknown account rather than falling back to root.
+			acct, err := lookupAccount(targetUser)
+			if err != nil {
+				log.Printf("agent: reject session: %v", err)
+				return nil, fmt.Errorf("unauthorized")
+			}
+
+			if isKeyAuthorized(acct, string(password)) {
 				return &ssh.Permissions{
-					Extensions: map[string]string{
-						"user": targetUser,
-					},
+					Extensions: map[string]string{"user": acct.Name},
 				}, nil
 			}
-			return nil, fmt.Errorf("unauthorized key for user %s", targetUser)
+			return nil, fmt.Errorf("unauthorized")
 		},
 		// PublicKeyCallback also accepts direct public key authentication if connected directly.
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
@@ -62,14 +66,19 @@ func NewAgentServer() (*AgentServer, error) {
 			if targetUser == "" {
 				targetUser = "root"
 			}
-			if isKeyAuthorized(targetUser, string(ssh.MarshalAuthorizedKey(key))) {
+
+			acct, err := lookupAccount(targetUser)
+			if err != nil {
+				log.Printf("agent: reject session: %v", err)
+				return nil, fmt.Errorf("unauthorized")
+			}
+
+			if isKeyAuthorized(acct, string(ssh.MarshalAuthorizedKey(key))) {
 				return &ssh.Permissions{
-					Extensions: map[string]string{
-						"user": targetUser,
-					},
+					Extensions: map[string]string{"user": acct.Name},
 				}, nil
 			}
-			return nil, fmt.Errorf("unauthorized key for user %s", targetUser)
+			return nil, fmt.Errorf("unauthorized")
 		},
 	}
 	sshConfig.AddHostKey(signer)
@@ -112,12 +121,22 @@ func (a *AgentServer) handleStream(stream net.Conn) {
 			newCh.Reject(ssh.UnknownChannelType, "only session channels supported")
 			continue
 		}
+		// Re-resolve from the authenticated identity. Failing here means the
+		// account vanished between auth and channel open; refuse rather than
+		// serve the session with an unresolved (and therefore root) identity.
+		acct, err := lookupAccount(sConn.User())
+		if err != nil {
+			log.Printf("agent: reject channel: %v", err)
+			newCh.Reject(ssh.Prohibited, "unauthorized")
+			continue
+		}
+
 		ch, chReqs, err := newCh.Accept()
 		if err != nil {
 			log.Printf("agent: accept channel: %v", err)
 			return
 		}
-		go handleSessionChannel(ch, chReqs, sConn.User())
+		go handleSessionChannel(ch, chReqs, acct)
 	}
 }
 
@@ -146,7 +165,7 @@ type envPayload struct {
 	Value string
 }
 
-func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, username string) {
+func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, acct *account) {
 	defer ch.Close()
 
 	var (
@@ -196,9 +215,8 @@ func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, username str
 
 		case "shell":
 			req.Reply(true, nil)
-			shell := getDefaultShell(username)
-			cmd := exec.Command(shell)
-			cmd.Env = buildEnv(username, ptyReq, envVars)
+			cmd := exec.Command(acct.Shell)
+			prepareCommand(cmd, acct, ptyReq, envVars)
 			runProcess(ch, cmd, ptyReq, &ptyFile, &cmdMutex)
 			return
 
@@ -206,9 +224,8 @@ func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, username str
 			var ep execPayload
 			if err := ssh.Unmarshal(req.Payload, &ep); err == nil {
 				req.Reply(true, nil)
-				shell := getDefaultShell(username)
-				cmd := exec.Command(shell, "-c", ep.Command)
-				cmd.Env = buildEnv(username, ptyReq, envVars)
+				cmd := exec.Command(acct.Shell, "-c", ep.Command)
+				prepareCommand(cmd, acct, ptyReq, envVars)
 				runProcess(ch, cmd, ptyReq, &ptyFile, &cmdMutex)
 				return
 			}
@@ -291,20 +308,48 @@ func sendExitStatus(ch ssh.Channel, code uint32) {
 	_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(&msg))
 }
 
-func buildEnv(username string, ptyReq *ptyReqPayload, extraEnv []string) []string {
-	env := os.Environ()
-	env = append(env, fmt.Sprintf("USER=%s", username))
-	env = append(env, fmt.Sprintf("LOGNAME=%s", username))
-
-	home := "/root"
-	if username != "root" && username != "" {
-		if u, err := user.Lookup(username); err == nil && u.HomeDir != "" {
-			home = u.HomeDir
-		} else {
-			home = "/home/" + username
+// prepareCommand configures a session process to run AS the resolved account:
+// it drops privileges, sets the working directory to the account's home, and
+// builds a clean environment.
+//
+// The agent itself runs as root. Without the credential below every session --
+// including one for an unprivileged account -- would execute as root.
+func prepareCommand(cmd *exec.Cmd, acct *account, ptyReq *ptyReqPayload, extraEnv []string) {
+	if cred := acct.credential(); cred != nil {
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
 		}
+		cmd.SysProcAttr.Credential = cred
 	}
-	env = append(env, fmt.Sprintf("HOME=%s", home))
+
+	// Start in the account's home, but fall back to / if it does not exist
+	// (e.g. nobody's /nonexistent). A missing Dir makes exec fail outright.
+	cmd.Dir = "/"
+	if fi, err := os.Stat(acct.Home); err == nil && fi.IsDir() {
+		cmd.Dir = acct.Home
+	}
+
+	cmd.Env = buildEnv(acct, ptyReq, extraEnv)
+}
+
+// buildEnv constructs the environment for a session process.
+//
+// It deliberately does NOT inherit the agent's os.Environ(): the agent runs as
+// root under systemd, and leaking its environment into an unprivileged session
+// discloses agent configuration and can alter the target's behaviour.
+func buildEnv(acct *account, ptyReq *ptyReqPayload, extraEnv []string) []string {
+	path := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	if !acct.IsRoot() {
+		path = "/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"
+	}
+
+	env := []string{
+		fmt.Sprintf("USER=%s", acct.Name),
+		fmt.Sprintf("LOGNAME=%s", acct.Name),
+		fmt.Sprintf("HOME=%s", acct.Home),
+		fmt.Sprintf("SHELL=%s", acct.Shell),
+		fmt.Sprintf("PATH=%s", path),
+	}
 
 	if ptyReq != nil && ptyReq.Term != "" {
 		env = append(env, fmt.Sprintf("TERM=%s", ptyReq.Term))
@@ -312,25 +357,45 @@ func buildEnv(username string, ptyReq *ptyReqPayload, extraEnv []string) []strin
 		env = append(env, "TERM=xterm-256color")
 	}
 
-	env = append(env, extraEnv...)
+	// Client-supplied env vars are appended last but filtered: variables that
+	// influence the dynamic loader would let a client subvert the session.
+	for _, kv := range extraEnv {
+		if isUnsafeEnv(kv) {
+			continue
+		}
+		env = append(env, kv)
+	}
 	return env
 }
 
-func getDefaultShell(username string) string {
-	if u, err := user.Lookup(username); err == nil && u.HomeDir != "" {
-		// shell lookup
+// isUnsafeEnv reports whether a client-supplied environment variable must be
+// dropped. LD_* and friends can hijack execution via the dynamic loader.
+func isUnsafeEnv(kv string) bool {
+	name, _, ok := strings.Cut(kv, "=")
+	if !ok {
+		return true
 	}
-	if shell := os.Getenv("SHELL"); shell != "" {
-		return shell
+	switch {
+	case strings.HasPrefix(name, "LD_"),
+		strings.HasPrefix(name, "BASH_ENV"),
+		name == "IFS",
+		name == "PATH",
+		name == "SHELL",
+		name == "HOME",
+		name == "USER",
+		name == "LOGNAME":
+		return true
 	}
-	if _, err := os.Stat("/bin/bash"); err == nil {
-		return "/bin/bash"
-	}
-	return "/bin/sh"
+	return false
 }
 
-func isKeyAuthorized(username, clientKeyStr string) bool {
-	if clientKeyStr == "" {
+// isKeyAuthorized reports whether clientKeyStr appears in the authorized_keys
+// of the given resolved account.
+//
+// Only files inside that account's own home directory are consulted, so a key
+// authorized for one account can never satisfy a login as another.
+func isKeyAuthorized(acct *account, clientKeyStr string) bool {
+	if clientKeyStr == "" || acct == nil {
 		return false
 	}
 	clientKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(clientKeyStr))
@@ -341,7 +406,7 @@ func isKeyAuthorized(username, clientKeyStr string) bool {
 	clientKeyBytes := clientKey.Marshal()
 	clientFp := ssh.FingerprintSHA256(clientKey)
 
-	paths := getAuthorizedKeysPaths(username)
+	paths := acct.authorizedKeysPaths()
 	for _, authKeysPath := range paths {
 		data, err := os.ReadFile(authKeysPath)
 		if err != nil {
@@ -357,46 +422,14 @@ func isKeyAuthorized(username, clientKeyStr string) bool {
 			if err != nil {
 				continue
 			}
-			if string(key.Marshal()) == string(clientKeyBytes) {
-				log.Printf("agent: authorized key %s for user %s (matched in %s)", clientFp, username, authKeysPath)
+			if subtle.ConstantTimeCompare(key.Marshal(), clientKeyBytes) == 1 {
+				log.Printf("agent: authorized key %s for account %s (matched in %s)",
+					clientFp, acct.Name, authKeysPath)
 				return true
 			}
 		}
 	}
 
-	log.Printf("agent: key %s not found in authorized_keys for user %s (checked: %v)", clientFp, username, paths)
-	return false
-}
-
-func getAuthorizedKeysPaths(username string) []string {
-	var paths []string
-
-	if username == "root" || username == "" {
-		paths = append(paths, "/root/.ssh/authorized_keys", "/root/.ssh/authorized_keys2")
-	} else {
-		if u, err := user.Lookup(username); err == nil && u.HomeDir != "" {
-			paths = append(paths, filepath.Join(u.HomeDir, ".ssh", "authorized_keys"))
-			paths = append(paths, filepath.Join(u.HomeDir, ".ssh", "authorized_keys2"))
-		}
-		paths = append(paths, filepath.Join("/home", username, ".ssh", "authorized_keys"))
-	}
-
-	// Also check current process user's ~/.ssh/authorized_keys as fallback
-	if curUser, err := user.Current(); err == nil && curUser.HomeDir != "" {
-		curPath := filepath.Join(curUser.HomeDir, ".ssh", "authorized_keys")
-		if !contains(paths, curPath) {
-			paths = append(paths, curPath)
-		}
-	}
-
-	return paths
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
+	log.Printf("agent: key %s not authorized for account %s (checked: %v)", clientFp, acct.Name, paths)
 	return false
 }
