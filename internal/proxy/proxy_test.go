@@ -263,7 +263,7 @@ func TestDirectMode_Rejected(t *testing.T) {
 	cfg := &config.Config{
 		Listen:   config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
 		HostKey:  "/dev/null",
-		Backends: []config.Backend{{ID: "x", Mode: "direct", Address: "127.0.0.1:22"}},
+		Backends: []config.Backend{{ID: "x", Mode: "direct"}},
 		Routes:   []config.Route{{Username: "*", Backend: "x"}},
 	}
 	if err := cfg.Validate(); err == nil {

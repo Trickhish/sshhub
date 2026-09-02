@@ -59,3 +59,38 @@ func TestResolveNoMatch(t *testing.T) {
 		t.Fatal("expected no match")
 	}
 }
+
+// The Unix account a session runs as must come from the matched route's
+// end_user, never from the client-supplied login string. A client naming
+// itself "root" must not obtain root unless a route says so.
+func TestResolveRoute_EndUserComesFromConfigNotClient(t *testing.T) {
+	router := New([]config.Route{
+		{Match: config.Match{Username: "admin", Hostname: "w1"}, Backend: "w1", EndUser: "root"},
+		{Match: config.Match{Hostname: "w1"}, Backend: "w1", EndUser: "deploy"},
+		{Match: config.Match{Hostname: "w2"}, Backend: "w2"},
+	})
+
+	cases := []struct {
+		login   string
+		backend string
+		endUser string
+	}{
+		{"admin@w1", "w1", "root"},
+		{"deploy@w1", "w1", "deploy"},
+		// Client claims "root" but only the second w1 rule matches -> deploy.
+		{"root@w1", "w1", "deploy"},
+		// No end_user configured -> default, not the client's "root".
+		{"root@w2", "w2", "root"},
+		{"anyone@w2", "w2", "root"},
+	}
+	for _, c := range cases {
+		rt, ok := router.ResolveRoute(ParseRequest(c.login))
+		if !ok {
+			t.Fatalf("ResolveRoute(%q): no match", c.login)
+		}
+		if rt.Backend != c.backend || rt.ResolvedEndUser() != c.endUser {
+			t.Errorf("ResolveRoute(%q) = backend %q end_user %q, want %q/%q",
+				c.login, rt.Backend, rt.ResolvedEndUser(), c.backend, c.endUser)
+		}
+	}
+}

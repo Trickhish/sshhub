@@ -29,7 +29,7 @@ routes:
 	}
 
 	// 1. Add new backend worker1
-	token, err := AddBackend(path, "worker1", "")
+	token, err := AddBackend(path, "worker1", "", "")
 	if err != nil {
 		t.Fatalf("AddBackend failed: %v", err)
 	}
@@ -62,7 +62,7 @@ routes:
 	}
 
 	// 2. Duplicate add should fail
-	if _, err := AddBackend(path, "worker1", ""); err == nil {
+	if _, err := AddBackend(path, "worker1", "", ""); err == nil {
 		t.Fatal("expected error adding duplicate backend")
 	}
 

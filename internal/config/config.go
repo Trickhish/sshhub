@@ -4,20 +4,21 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 // Config is the top-level sshhub hub configuration.
 type Config struct {
-	Listen         Listen    `yaml:"listen"`
-	PublicHost     string    `yaml:"public_host,omitempty"`
-	HostKey        string    `yaml:"host_key"`
-	TLSCert        string    `yaml:"tls_cert,omitempty"`
-	TLSKey         string    `yaml:"tls_key,omitempty"`
-	ControlTokens  []string  `yaml:"control_tokens,omitempty"`
-	Backends       []Backend `yaml:"backends"`
-	Routes         []Route   `yaml:"routes"`
+	Listen        Listen    `yaml:"listen"`
+	PublicHost    string    `yaml:"public_host,omitempty"`
+	HostKey       string    `yaml:"host_key"`
+	TLSCert       string    `yaml:"tls_cert,omitempty"`
+	TLSKey        string    `yaml:"tls_key,omitempty"`
+	ControlTokens []string  `yaml:"control_tokens,omitempty"`
+	Backends      []Backend `yaml:"backends"`
+	Routes        []Route   `yaml:"routes"`
 }
 
 // Listen holds the addresses the hub binds to.
@@ -26,13 +27,20 @@ type Listen struct {
 	Control string `yaml:"control"`
 }
 
-// Backend describes a single SSH backend server.
+// Backend describes a single agent-backed backend server.
 type Backend struct {
-	ID          string `yaml:"id"`
-	Mode        string `yaml:"mode"` // must be "reverse" (agent-backed); "direct" is no longer supported
-	Token       string `yaml:"token,omitempty"` // per-backend token for reverse mode
-	Address     string `yaml:"address,omitempty"`
-	Username    string `yaml:"username,omitempty"`
+	ID    string `yaml:"id"`
+	Mode  string `yaml:"mode"`            // must be "reverse" (agent-backed)
+	Token string `yaml:"token,omitempty"` // per-backend registration token
+
+	// Username is no longer honoured. The Unix account a session runs as is
+	// determined solely by the matched route's end_user (defaulting to root).
+	// A config still carrying this field is REJECTED by Validate rather than
+	// silently ignored: ignoring it would quietly escalate a session that used
+	// to run as an unprivileged account into running as root.
+	Username string `yaml:"username,omitempty"`
+
+	// HostKey/HostKeyFile pin the agent's SSH host key. Not yet enforced.
 	HostKey     string `yaml:"host_key,omitempty"`
 	HostKeyFile string `yaml:"host_key_file,omitempty"`
 }
@@ -40,11 +48,17 @@ type Backend struct {
 // Route maps a matching request to a backend.
 // Supports both flat route syntax (hostname, username, backend)
 // and nested match blocks (match: { hostname, username }, backend).
+//
+// Username/Hostname are ROUTING IDENTIFIERS matched against the client's login
+// string; they need not correspond to any Unix account. EndUser is the Unix
+// account the session actually runs as on the backend, and comes only from this
+// config -- never from client input.
 type Route struct {
 	Match    Match  `yaml:"-"`
 	Backend  string `yaml:"backend"`
 	Username string `yaml:"username,omitempty"`
 	Hostname string `yaml:"hostname,omitempty"`
+	EndUser  string `yaml:"end_user,omitempty"`
 }
 
 // UnmarshalYAML decodes a route supporting both flat and nested match syntax.
@@ -54,6 +68,7 @@ func (r *Route) UnmarshalYAML(value *yaml.Node) error {
 		Backend  string `yaml:"backend"`
 		Username string `yaml:"username"`
 		Hostname string `yaml:"hostname"`
+		EndUser  string `yaml:"end_user"`
 	}
 	var raw rawRoute
 	if err := value.Decode(&raw); err != nil {
@@ -62,6 +77,7 @@ func (r *Route) UnmarshalYAML(value *yaml.Node) error {
 	r.Backend = raw.Backend
 	r.Username = raw.Username
 	r.Hostname = raw.Hostname
+	r.EndUser = raw.EndUser
 	r.Match = raw.Match
 
 	if r.Username != "" && r.Match.Username == "" {
@@ -84,6 +100,7 @@ func (r Route) MarshalYAML() (interface{}, error) {
 	type flatRoute struct {
 		Username string `yaml:"username,omitempty"`
 		Hostname string `yaml:"hostname,omitempty"`
+		EndUser  string `yaml:"end_user,omitempty"`
 		Backend  string `yaml:"backend"`
 	}
 	username := r.Username
@@ -97,8 +114,21 @@ func (r Route) MarshalYAML() (interface{}, error) {
 	return flatRoute{
 		Username: username,
 		Hostname: hostname,
+		EndUser:  r.EndUser,
 		Backend:  r.Backend,
 	}, nil
+}
+
+// DefaultEndUser is the Unix account a session runs as when the matched route
+// does not specify end_user.
+const DefaultEndUser = "root"
+
+// ResolvedEndUser returns the Unix account this route's sessions run as.
+func (r Route) ResolvedEndUser() string {
+	if r.EndUser != "" {
+		return r.EndUser
+	}
+	return DefaultEndUser
 }
 
 // Match is the set of routing predicates. Empty values are wildcards.
@@ -167,6 +197,14 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("backend %q: mode must be \"reverse\"", b.ID)
 		}
+
+		// Reject rather than ignore: silently dropping username would promote a
+		// session that previously ran as an unprivileged account to root.
+		if b.Username != "" {
+			return fmt.Errorf("backend %q: \"username\" is no longer supported; "+
+				"set \"end_user: %s\" on the route(s) targeting this backend instead",
+				b.ID, b.Username)
+		}
 	}
 
 	if len(c.Routes) == 0 {
@@ -187,6 +225,18 @@ func (c *Config) Validate() error {
 		}
 		if !seen[r.Backend] {
 			return fmt.Errorf("route %d: unknown backend %q", i, r.Backend)
+		}
+
+		// end_user names a Unix account on the backend. The hub cannot verify it
+		// exists (only the agent can), but it can reject values that could never
+		// be a valid account name and would otherwise fail confusingly at runtime.
+		if r.EndUser != "" {
+			if strings.ContainsAny(r.EndUser, " \t\n/:,") {
+				return fmt.Errorf("route %d: invalid end_user %q", i, r.EndUser)
+			}
+			if strings.HasPrefix(r.EndUser, "-") {
+				return fmt.Errorf("route %d: invalid end_user %q", i, r.EndUser)
+			}
 		}
 	}
 	return nil

@@ -70,24 +70,28 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 		// error. The hub asserts no identity of its own and holds no key that
 		// authenticates to a backend.
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			backendID, targetUser := s.resolveBackendAndUser(conn.User())
-			if backendID == "" {
+			res, ok := s.resolveBackend(conn.User())
+			if !ok {
 				return nil, fmt.Errorf("no route for user %q", conn.User())
 			}
-			backend := s.cfg.BackendByID(backendID)
+			backend := s.cfg.BackendByID(res.BackendID)
 			if backend == nil {
-				return nil, fmt.Errorf("backend %q not found", backendID)
+				return nil, fmt.Errorf("backend %q not found", res.BackendID)
 			}
 
-			// Delegate authorization to the backend agent in real time.
-			if err := s.verifyBackendAgentKey(backend, targetUser, key); err != nil {
-				return nil, fmt.Errorf("unauthorized key for backend %s", backendID)
+			// Delegate authorization to the backend agent in real time. The agent
+			// checks the key against end_user's authorized_keys on the node.
+			if err := s.verifyBackendAgentKey(backend, res.EndUser, key); err != nil {
+				return nil, fmt.Errorf("unauthorized key for backend %s", res.BackendID)
 			}
 
+			// Record the resolved end user so the session path cannot re-derive a
+			// different (client-influenced) value later.
 			return &ssh.Permissions{
 				Extensions: map[string]string{
-					"user":   conn.User(),
-					"pubkey": string(ssh.MarshalAuthorizedKey(key)),
+					"backend":  res.BackendID,
+					"end_user": res.EndUser,
+					"pubkey":   string(ssh.MarshalAuthorizedKey(key)),
 				},
 			}, nil
 		},
@@ -205,10 +209,12 @@ func (s *Server) handleChannel(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 }
 
 func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel) {
-	backendID, targetUser := s.resolveBackendAndUser(serverConn.User())
-	if backendID == "" {
-		log.Printf("ssh: no route for user %q", serverConn.User())
-		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("sshhub: no route for user %q", serverConn.User()))
+	// Use the backend and end user pinned during authentication. Re-resolving
+	// here would risk diverging from what the agent actually authorized.
+	backendID, endUser, err := authorizedTarget(serverConn.Permissions)
+	if err != nil {
+		log.Printf("ssh: session rejected: %v", err)
+		newCh.Reject(ssh.Prohibited, "sshhub: unauthorized")
 		return
 	}
 
@@ -221,9 +227,9 @@ func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 
 	// Open an authenticated connection to the agent, passing ONLY the client's
 	// verified public key (never a hub-held credential).
-	backendConn, backendChans, backendReqs, err := s.dialBackendAgent(backend, targetUser, serverConn.Permissions)
+	backendConn, backendChans, backendReqs, err := s.dialBackendAgent(backend, endUser, serverConn.Permissions)
 	if err != nil {
-		log.Printf("ssh: backend %q auth failed for user %q: %v", backendID, targetUser, err)
+		log.Printf("ssh: backend %q auth failed for user %q: %v", backendID, endUser, err)
 		newCh.Reject(ssh.Prohibited, fmt.Sprintf("Permission denied (publickey) on backend %s", backendID))
 		return
 	}
@@ -245,7 +251,7 @@ func (s *Server) handleSession(serverConn *ssh.ServerConn, newCh ssh.NewChannel)
 	}
 	defer clientCh.Close()
 
-	log.Printf("ssh: session %s -> backend %q (user %q)", serverConn.RemoteAddr(), backendID, targetUser)
+	log.Printf("ssh: session %s -> backend %q (end_user %q)", serverConn.RemoteAddr(), backendID, endUser)
 
 	go func() {
 		for req := range clientReqs {
@@ -304,11 +310,26 @@ func (s *Server) handleDirectTCPIP(serverConn *ssh.ServerConn, newCh ssh.NewChan
 		return
 	}
 
-	backendID, _ := s.resolveBackendAndUserHint(serverConn.User(), payload.DestAddr)
-	if backendID == "" {
-		log.Printf("ssh: direct-tcpip: no route for user %q dest %q", serverConn.User(), payload.DestAddr)
-		newCh.Reject(ssh.ConnectionFailed, fmt.Sprintf("no route to host %s", payload.DestAddr))
+	// The authorized backend is the one the agent approved this key for during
+	// the handshake. DestAddr is attacker-controlled and MUST NOT widen that
+	// grant: previously it was fed back into routing, letting a client
+	// authorized for one backend open a raw pipe to another.
+	backendID, _, err := authorizedTarget(serverConn.Permissions)
+	if err != nil {
+		log.Printf("ssh: direct-tcpip rejected: %v", err)
+		newCh.Reject(ssh.Prohibited, "sshhub: unauthorized")
 		return
+	}
+
+	// If the client named a destination, it must resolve to the same backend it
+	// was authorized for.
+	if requested, ok := s.resolveBackendHint(serverConn.User(), payload.DestAddr); ok {
+		if requested.BackendID != backendID {
+			log.Printf("ssh: direct-tcpip: client authorized for %q attempted %q (dest %q)",
+				backendID, requested.BackendID, payload.DestAddr)
+			newCh.Reject(ssh.Prohibited, "sshhub: destination not authorized")
+			return
+		}
 	}
 
 	backend := s.cfg.BackendByID(backendID)
@@ -424,14 +445,29 @@ func (s *Server) dialBackendAgent(backend *config.Backend, targetUser string, pe
 	return ssh.NewClientConn(rawConn, backend.ID, clientConfig)
 }
 
-// resolveBackendAndUser resolves the target backend and backend username from the
-// client's login username (e.g. "cidev", "root@cidev", "nuc").
-func (s *Server) resolveBackendAndUser(loginUser string) (string, string) {
-	return s.resolveBackendAndUserHint(loginUser, "")
+// resolution is the outcome of routing a client login to a backend.
+type resolution struct {
+	// BackendID is the agent-backed backend to relay to.
+	BackendID string
+	// EndUser is the Unix account the session runs as on that backend. It comes
+	// exclusively from the matched route's end_user (or the DefaultEndUser
+	// fallback) and is NEVER derived from the client's login string.
+	EndUser string
 }
 
-// resolveBackendAndUserHint additionally considers a ProxyJump destination hint.
-func (s *Server) resolveBackendAndUserHint(loginUser, hint string) (string, string) {
+// resolveBackend resolves the target backend from the client's login username
+// (e.g. "cidev", "root@cidev", "nuc").
+func (s *Server) resolveBackend(loginUser string) (resolution, bool) {
+	return s.resolveBackendHint(loginUser, "")
+}
+
+// resolveBackendHint additionally considers a ProxyJump destination hint.
+//
+// The login string and hint are ROUTING IDENTIFIERS only. They select which
+// route matches; they never determine the Unix account the session runs as.
+// That comes from the matched route's end_user, so a client cannot request a
+// privileged account by choosing its login name.
+func (s *Server) resolveBackendHint(loginUser, hint string) (resolution, bool) {
 	req := routing.ParseRequest(loginUser)
 	hint = strings.TrimSpace(hint)
 
@@ -451,50 +487,65 @@ func (s *Server) resolveBackendAndUserHint(loginUser, hint string) (string, stri
 			req.Hostname = host
 		}
 
-		if id, ok := s.router.Resolve(req); ok {
-			return id, s.effectiveBackendUser(id, req.Username)
+		if r, ok := s.router.ResolveRoute(req); ok {
+			return s.fromRoute(r), true
 		}
-		if id, ok := s.router.Resolve(routing.Request{Username: "*", Hostname: host}); ok {
-			return id, s.effectiveBackendUser(id, req.Username)
+		if r, ok := s.router.ResolveRoute(routing.Request{Username: "*", Hostname: host}); ok {
+			return s.fromRoute(r), true
 		}
 		if b := s.cfg.BackendByID(host); b != nil {
-			return b.ID, s.effectiveBackendUser(b.ID, req.Username)
+			return s.fromBackendID(b.ID), true
 		}
 	}
 
 	if req.Hostname != "" {
-		if id, ok := s.router.Resolve(req); ok {
-			return id, s.effectiveBackendUser(id, req.Username)
+		if r, ok := s.router.ResolveRoute(req); ok {
+			return s.fromRoute(r), true
 		}
 		if b := s.cfg.BackendByID(req.Hostname); b != nil {
-			return b.ID, s.effectiveBackendUser(b.ID, req.Username)
+			return s.fromBackendID(b.ID), true
 		}
 	}
 
 	if b := s.cfg.BackendByID(req.Username); b != nil {
-		return b.ID, s.effectiveBackendUser(b.ID, "")
+		return s.fromBackendID(b.ID), true
 	}
-	if id, ok := s.router.Resolve(routing.Request{Username: "*", Hostname: req.Username}); ok {
-		return id, s.effectiveBackendUser(id, "")
+	if r, ok := s.router.ResolveRoute(routing.Request{Username: "*", Hostname: req.Username}); ok {
+		return s.fromRoute(r), true
 	}
-	if id, ok := s.router.Resolve(req); ok {
-		return id, s.effectiveBackendUser(id, req.Username)
+	if r, ok := s.router.ResolveRoute(req); ok {
+		return s.fromRoute(r), true
 	}
 
-	return "", ""
+	return resolution{}, false
 }
 
-func (s *Server) effectiveBackendUser(backendID, clientUser string) string {
-	b := s.cfg.BackendByID(backendID)
-	if b != nil && b.Username != "" {
-		return b.Username
-	}
-	if clientUser != "" && clientUser != "*" {
-		return clientUser
-	}
-	return "root"
+// fromRoute builds a resolution from an explicitly matched route.
+func (s *Server) fromRoute(r config.Route) resolution {
+	return resolution{BackendID: r.Backend, EndUser: r.ResolvedEndUser()}
 }
 
+// fromBackendID builds a resolution for a direct backend-ID match, where no
+// route was involved and therefore no end_user was specified.
+func (s *Server) fromBackendID(id string) resolution {
+	return resolution{BackendID: id, EndUser: config.DefaultEndUser}
+}
+
+// authorizedTarget returns the backend and end user that were authorized by the
+// agent during the SSH handshake and recorded in Permissions. It fails closed:
+// a connection without these extensions never reached a successful
+// PublicKeyCallback and must not be served.
+func authorizedTarget(perms *ssh.Permissions) (backendID, endUser string, err error) {
+	if perms == nil || perms.Extensions == nil {
+		return "", "", fmt.Errorf("connection has no authorization record")
+	}
+	backendID = perms.Extensions["backend"]
+	endUser = perms.Extensions["end_user"]
+	if backendID == "" || endUser == "" {
+		return "", "", fmt.Errorf("connection has incomplete authorization record")
+	}
+	return backendID, endUser, nil
+}
 
 // bridge copies bytes bidirectionally between two streams.
 func bridge(a io.ReadWriteCloser, b io.ReadWriteCloser) {

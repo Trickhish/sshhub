@@ -3,7 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadAndValidate(t *testing.T) {
@@ -67,7 +70,7 @@ func TestValidateErrors(t *testing.T) {
 			Listen:  Listen{SSH: ":22", Control: ":7000"},
 			HostKey: "/k",
 			Backends: []Backend{
-				{ID: "b", Mode: "direct", Address: "10.0.0.1:22"},
+				{ID: "b", Mode: "direct"},
 			},
 		}},
 		{"duplicate backend", Config{
@@ -103,5 +106,58 @@ func TestValidateErrors(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+// A config still carrying backend.username must be REJECTED, not ignored.
+// Silently dropping it would promote sessions that previously ran as an
+// unprivileged account to running as root.
+func TestValidate_RejectsBackendUsername(t *testing.T) {
+	cfg := Config{
+		Listen:   Listen{SSH: ":22", Control: ":7000"},
+		HostKey:  "/k",
+		Backends: []Backend{{ID: "b", Mode: "reverse", Username: "deploy"}},
+		Routes:   []Route{{Username: "*", Backend: "b"}},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("config.Validate MUST reject backend.username rather than ignore it")
+	}
+	if !strings.Contains(err.Error(), "end_user") {
+		t.Errorf("error should point at the end_user migration, got: %v", err)
+	}
+}
+
+func TestValidate_RejectsMalformedEndUser(t *testing.T) {
+	for _, bad := range []string{"a b", "a/b", "a:b", "-rf", "a,b"} {
+		cfg := Config{
+			Listen:   Listen{SSH: ":22", Control: ":7000"},
+			HostKey:  "/k",
+			Backends: []Backend{{ID: "b", Mode: "reverse"}},
+			Routes:   []Route{{Username: "*", Backend: "b", EndUser: bad}},
+		}
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("end_user %q MUST be rejected", bad)
+		}
+	}
+}
+
+func TestRoute_EndUserRoundTrip(t *testing.T) {
+	in := []byte("routes:\n  - hostname: w1\n    end_user: deploy\n    backend: w1\n")
+	var c struct {
+		Routes []Route `yaml:"routes"`
+	}
+	if err := yaml.Unmarshal(in, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Routes[0].EndUser != "deploy" {
+		t.Fatalf("end_user not parsed: %+v", c.Routes[0])
+	}
+	out, err := yaml.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "end_user: deploy") {
+		t.Fatalf("end_user not preserved on marshal:\n%s", out)
 	}
 }

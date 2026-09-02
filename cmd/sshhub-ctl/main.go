@@ -29,25 +29,40 @@ func main() {
 			cfgPath     = defaultConfigPath()
 			hubAddr     = ""
 			customToken = ""
+			endUser     = ""
 			noRestart   = false
 			id          = ""
 		)
 
+		// NOTE: the increment must happen on the loop variable, not inside the
+		// switch arm; a bare `i++` in a case is shadowed by the loop's own i++
+		// and the flag's value would be misread as the backend id.
 		for i := 2; i < len(os.Args); i++ {
 			arg := os.Args[i]
+			next := ""
+			hasNext := i+1 < len(os.Args)
+			if hasNext {
+				next = os.Args[i+1]
+			}
+
 			switch {
-			case arg == "--hub" && i+1 < len(os.Args):
-				hubAddr = os.Args[i+1]
+			case arg == "--hub" && hasNext:
+				hubAddr = next
 				i++
 			case strings.HasPrefix(arg, "--hub="):
 				hubAddr = strings.TrimPrefix(arg, "--hub=")
-			case arg == "--token" && i+1 < len(os.Args):
-				customToken = os.Args[i+1]
+			case arg == "--token" && hasNext:
+				customToken = next
 				i++
 			case strings.HasPrefix(arg, "--token="):
 				customToken = strings.TrimPrefix(arg, "--token=")
-			case arg == "--config" && i+1 < len(os.Args):
-				cfgPath = os.Args[i+1]
+			case arg == "--end-user" && hasNext:
+				endUser = next
+				i++
+			case strings.HasPrefix(arg, "--end-user="):
+				endUser = strings.TrimPrefix(arg, "--end-user=")
+			case arg == "--config" && hasNext:
+				cfgPath = next
 				i++
 			case strings.HasPrefix(arg, "--config="):
 				cfgPath = strings.TrimPrefix(arg, "--config=")
@@ -59,10 +74,11 @@ func main() {
 		}
 
 		if id == "" {
-			log.Fatal("usage: sshhub-ctl add <backend-id> [--config <path>] [--hub <host:port>] [--token <custom-token>]")
+			log.Fatal("usage: sshhub-ctl add <backend-id> [--config <path>] [--hub <host:port>] " +
+				"[--token <custom-token>] [--end-user <unix-user>]")
 		}
 
-		token, err := config.AddBackend(cfgPath, id, customToken)
+		token, err := config.AddBackend(cfgPath, id, customToken, endUser)
 		if err != nil {
 			log.Fatalf("error: %v", err)
 		}
@@ -178,19 +194,35 @@ func main() {
 			log.Fatalf("load config: %v", err)
 		}
 
+		// Collect the end users each backend is reachable as, so the operator can
+		// see at a glance which nodes have routes granting root.
+		endUsers := make(map[string][]string)
+		for _, r := range cfg.Routes {
+			u := r.ResolvedEndUser()
+			for _, existing := range endUsers[r.Backend] {
+				if existing == u {
+					u = ""
+					break
+				}
+			}
+			if u != "" {
+				endUsers[r.Backend] = append(endUsers[r.Backend], u)
+			}
+		}
+
 		fmt.Printf("Backends configured in %s:\n\n", cfgPath)
-		fmt.Printf("%-15s %-10s %-15s %s\n", "ID", "MODE", "ADDRESS", "TOKEN")
-		fmt.Printf("%-15s %-10s %-15s %s\n", "---------------", "----------", "---------------", "------------------------------------------")
+		fmt.Printf("%-15s %-10s %-20s %s\n", "ID", "MODE", "END USERS", "TOKEN")
+		fmt.Printf("%-15s %-10s %-20s %s\n", "---------------", "----------", "--------------------", "------------------------------------------")
 		for _, b := range cfg.Backends {
-			addr := b.Address
-			if addr == "" {
-				addr = "-"
+			users := "-"
+			if u := endUsers[b.ID]; len(u) > 0 {
+				users = strings.Join(u, ",")
 			}
 			tok := b.Token
 			if tok == "" {
 				tok = "-"
 			}
-			fmt.Printf("%-15s %-10s %-15s %s\n", b.ID, b.Mode, addr, tok)
+			fmt.Printf("%-15s %-10s %-20s %s\n", b.ID, b.Mode, users, tok)
 		}
 		fmt.Println()
 

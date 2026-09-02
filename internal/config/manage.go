@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -20,9 +21,13 @@ func GenerateToken() (string, error) {
 
 // AddBackend adds a new reverse backend and route to the given config file.
 // If token is empty, a secure random token is generated.
-func AddBackend(configPath, id, token string) (string, error) {
+// If endUser is empty, sessions run as DefaultEndUser (root).
+func AddBackend(configPath, id, token, endUser string) (string, error) {
 	if id == "" {
 		return "", fmt.Errorf("backend id cannot be empty")
+	}
+	if strings.ContainsAny(endUser, " \t\n/:,") || strings.HasPrefix(endUser, "-") {
+		return "", fmt.Errorf("invalid end user %q", endUser)
 	}
 
 	data, err := os.ReadFile(configPath)
@@ -65,6 +70,7 @@ func AddBackend(configPath, id, token string) (string, error) {
 		newRoute := Route{
 			Hostname: id,
 			Backend:  id,
+			EndUser:  endUser,
 		}
 		// Insert before any catch-all username: "*" route
 		inserted := false

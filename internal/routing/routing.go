@@ -15,7 +15,7 @@ type Router struct {
 type rule struct {
 	usernamePattern string
 	hostnamePattern string
-	backend         string
+	route           config.Route
 }
 
 // New builds a Router from the configured routes.
@@ -25,7 +25,7 @@ func New(routes []config.Route) *Router {
 		r.rules = append(r.rules, rule{
 			usernamePattern: normalize(rt.Match.Username),
 			hostnamePattern: normalize(rt.Match.Hostname),
-			backend:         rt.Backend,
+			route:           rt,
 		})
 	}
 	return r
@@ -55,16 +55,27 @@ func ParseRequest(user string) Request {
 	return Request{Username: user}
 }
 
-// Resolve returns the backend id for a request, or false if none matches.
-// Rules are evaluated in order; the first match wins.
-func (r *Router) Resolve(req Request) (string, bool) {
+// ResolveRoute returns the first matching route, or false if none matches.
+// Rules are evaluated in order; the first match wins. Callers need the whole
+// route (not just the backend id) because the route carries end_user, which
+// determines the Unix account the session runs as.
+func (r *Router) ResolveRoute(req Request) (config.Route, bool) {
 	for _, rl := range r.rules {
 		if matchPattern(rl.usernamePattern, req.Username) &&
 			matchPattern(rl.hostnamePattern, req.Hostname) {
-			return rl.backend, true
+			return rl.route, true
 		}
 	}
-	return "", false
+	return config.Route{}, false
+}
+
+// Resolve returns the backend id for a request, or false if none matches.
+func (r *Router) Resolve(req Request) (string, bool) {
+	rt, ok := r.ResolveRoute(req)
+	if !ok {
+		return "", false
+	}
+	return rt.Backend, true
 }
 
 // matchPattern performs a simple glob match where "*" matches any rune
