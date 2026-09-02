@@ -70,7 +70,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	backend, hostKey, err := s.register(session)
+	backend, req, err := s.register(session)
 	if err != nil {
 		log.Printf("control: %v", err)
 		session.Close()
@@ -80,12 +80,13 @@ func (s *Server) handleConn(conn net.Conn) {
 	// A second agent presenting the same token must not silently displace or
 	// shadow the first: previously this error was discarded, so the hub logged
 	// "connected" for a session that was never in the registry.
-	if err := s.registry.registerWithHostKey(backend, session, hostKey); err != nil {
+	if err := s.registry.registerConn(backend, session, req.HostKey, req, conn.RemoteAddr().String()); err != nil {
 		log.Printf("control: refusing registration for %q: %v", backend, err)
 		session.Close()
 		return
 	}
-	log.Printf("backend %q connected", backend)
+	log.Printf("backend %q connected (agent %s %s/%s from %s)",
+		backend, versionOrUnknown(req.Version), req.OS, req.Arch, conn.RemoteAddr())
 
 	// Remove the backend when the session drops.
 	<-session.CloseChan()
@@ -94,26 +95,26 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 // register waits for the agent's registration stream and validates it.
-func (s *Server) register(session *yamux.Session) (backendID string, hostKey string, err error) {
+func (s *Server) register(session *yamux.Session) (backendID string, req RegisterRequest, err error) {
 	stream, err := session.AcceptStream()
 	if err != nil {
-		return "", "", fmt.Errorf("accept registration stream: %w", err)
+		return "", req, fmt.Errorf("accept registration stream: %w", err)
 	}
 	defer stream.Close()
 
-	req, err := ReadRegister(stream)
+	req, err = ReadRegister(stream)
 	if err != nil {
-		return "", "", fmt.Errorf("read register request: %w", err)
+		return "", req, fmt.Errorf("read register request: %w", err)
 	}
 	if req.Token == "" {
 		WriteResponse(stream, RegisterResponse{OK: false, Error: "token is required"})
-		return "", "", &RegistrationError{Message: "token is required"}
+		return "", req, &RegistrationError{Message: "token is required"}
 	}
 
 	backendID, ok := s.resolveToken(req.Token, req.Backend)
 	if !ok {
 		WriteResponse(stream, RegisterResponse{OK: false, Error: "invalid token"})
-		return "", "", &RegistrationError{Message: "invalid token"}
+		return "", req, &RegistrationError{Message: "invalid token"}
 	}
 
 	// Only advertise an update when the hub is strictly NEWER. A plain
@@ -130,8 +131,15 @@ func (s *Server) register(session *yamux.Session) (backendID string, hostKey str
 	}
 
 	if err := WriteResponse(stream, resp); err != nil {
-		return "", "", fmt.Errorf("write register response: %w", err)
+		return "", req, fmt.Errorf("write register response: %w", err)
 	}
 
-	return backendID, req.HostKey, nil
+	return backendID, req, nil
+}
+
+func versionOrUnknown(v string) string {
+	if v == "" {
+		return "unknown"
+	}
+	return v
 }

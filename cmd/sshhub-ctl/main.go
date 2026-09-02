@@ -9,10 +9,14 @@ import (
 	"os/exec"
 	"strings"
 
+	"encoding/json"
+	"github.com/Trickhish/sshhub/internal/admin"
 	"github.com/Trickhish/sshhub/internal/config"
+	"github.com/Trickhish/sshhub/internal/control"
 	"github.com/Trickhish/sshhub/internal/hubtls"
 	"github.com/Trickhish/sshhub/internal/hubupdate"
 	"github.com/Trickhish/sshhub/internal/version"
+	"time"
 )
 
 const repoRawURL = "https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh"
@@ -189,9 +193,12 @@ func main() {
 
 	case "list", "ls":
 		cfgPath := defaultConfigPath()
+		jsonOut := false
 		for i := 2; i < len(os.Args); i++ {
 			arg := os.Args[i]
-			if arg == "--config" && i+1 < len(os.Args) {
+			if arg == "--json" {
+				jsonOut = true
+			} else if arg == "--config" && i+1 < len(os.Args) {
 				cfgPath = os.Args[i+1]
 				i++
 			} else if strings.HasPrefix(arg, "--config=") {
@@ -220,19 +227,99 @@ func main() {
 			}
 		}
 
+		// Live state comes from the hub's admin socket; the config file alone
+		// cannot know what is connected. If the socket is unavailable (hub not
+		// running, or an older hub without it) fall back to config-only output
+		// rather than failing, and say so.
+		var status *admin.Status
+		var statusErr error
+		if st, err := admin.Query(admin.DefaultSocketPath); err == nil {
+			status = st
+		} else {
+			statusErr = err
+		}
+
+		live := map[string]control.BackendStatus{}
+		if status != nil {
+			for _, b := range status.Backends {
+				live[b.Backend] = b
+			}
+		}
+
+		if jsonOut {
+			type row struct {
+				ID       string   `json:"id"`
+				EndUsers []string `json:"end_users"`
+				Online   bool     `json:"online"`
+				Version  string   `json:"version,omitempty"`
+				Platform string   `json:"platform,omitempty"`
+				Uptime   string   `json:"connected_for,omitempty"`
+				Remote   string   `json:"remote_addr,omitempty"`
+			}
+			rows := make([]row, 0, len(cfg.Backends))
+			for _, b := range cfg.Backends {
+				r := row{ID: b.ID, EndUsers: endUsers[b.ID]}
+				if l, ok := live[b.ID]; ok {
+					r.Online, r.Version, r.Remote = true, l.Version, l.RemoteAddr
+					if l.OS != "" {
+						r.Platform = l.OS + "/" + l.Arch
+					}
+					r.Uptime = shortDuration(time.Since(l.ConnectedAt))
+				}
+				rows = append(rows, r)
+			}
+			out, _ := json.MarshalIndent(rows, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+
 		fmt.Printf("Backends configured in %s:\n\n", cfgPath)
-		fmt.Printf("%-15s %-10s %-20s %s\n", "ID", "MODE", "END USERS", "TOKEN")
-		fmt.Printf("%-15s %-10s %-20s %s\n", "---------------", "----------", "--------------------", "------------------------------------------")
+		fmt.Printf("%-14s %-9s %-9s %-14s %-11s %s\n",
+			"ID", "STATUS", "VERSION", "PLATFORM", "CONNECTED", "END USERS")
+		fmt.Printf("%-14s %-9s %-9s %-14s %-11s %s\n",
+			"--------------", "---------", "---------", "--------------", "-----------", "----------")
+
+		var online int
 		for _, b := range cfg.Backends {
 			users := "-"
 			if u := endUsers[b.ID]; len(u) > 0 {
 				users = strings.Join(u, ",")
 			}
-			tok := b.Token
-			if tok == "" {
-				tok = "-"
+
+			st, ver, plat, up := "offline", "-", "-", "-"
+			if l, ok := live[b.ID]; ok {
+				online++
+				st = "online"
+				if l.Version != "" {
+					ver = l.Version
+				}
+				if l.OS != "" {
+					plat = l.OS + "/" + l.Arch
+				}
+				up = shortDuration(time.Since(l.ConnectedAt))
+			} else if status == nil {
+				st = "unknown"
 			}
-			fmt.Printf("%-15s %-10s %-20s %s\n", b.ID, b.Mode, users, tok)
+
+			fmt.Printf("%-14s %-9s %-9s %-14s %-11s %s\n", b.ID, st, ver, plat, up, users)
+		}
+
+		fmt.Println()
+		if status != nil {
+			fmt.Printf("%d/%d online. Hub %s, up %s.\n",
+				online, len(cfg.Backends), status.HubVersion, shortDuration(time.Since(status.StartedAt)))
+			var stale []string
+			for _, b := range cfg.Backends {
+				if l, ok := live[b.ID]; ok && l.Version != "" && l.Version != status.HubVersion {
+					stale = append(stale, fmt.Sprintf("%s (%s)", b.ID, l.Version))
+				}
+			}
+			if len(stale) > 0 {
+				fmt.Printf("Agents not on %s: %s\n", status.HubVersion, strings.Join(stale, ", "))
+			}
+		} else {
+			fmt.Printf("Live status unavailable (%v).\n", statusErr)
+			fmt.Println("Showing configuration only; run on the hub host as root for agent status.")
 		}
 		fmt.Println()
 
@@ -334,7 +421,8 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  add <id>     Add a new reverse backend, generate token, and update config")
 	fmt.Println("  remove <id>  Remove a backend and its routes from config")
-	fmt.Println("  list         List all configured backends and end users")
+	fmt.Println("  list         Show backends with agent status, version, and uptime")
+	fmt.Println("  list --json  Same, as JSON for scripting")
 	fmt.Println("  pin          Show the hub key pin agents must use (--hub-pin)")
 	fmt.Println("  update       Check for and apply updates from GitHub Releases")
 	fmt.Println("  version      Show current version")
@@ -367,4 +455,22 @@ func controlPlanePin(cfgPath string) string {
 		return "<unreadable certificate: " + err.Error() + ">"
 	}
 	return pin
+}
+
+// shortDuration renders a duration for operator output: "3d4h", "2h14m", "45s".
+// Go's default String() gives "2h14m32.19s", which is noise in a table.
+func shortDuration(d time.Duration) string {
+	if d < 0 {
+		return "-"
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
+	}
 }

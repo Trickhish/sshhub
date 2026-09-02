@@ -173,7 +173,8 @@ ssh worker1
 | `sshhub-ctl add <id>` | Generate a secure token, create route rules, and display the agent 1-liner |
 | `sshhub-ctl add <id> --end-user <user>` | As above, with sessions running as a specific Unix account |
 | `sshhub-ctl remove <id>` | Remove a backend node and its routing entries from the configuration |
-| `sshhub-ctl list` | List all configured backends, their end users, and tokens |
+| `sshhub-ctl list` | Show backends with agent status, version, platform, and connection uptime |
+| `sshhub-ctl list --json` | Same, as JSON for scripting |
 | `sshhub-ctl pin` | Show the Hub key pin agents need for `--hub-pin` |
 | `sshhub-ctl update` | Check GitHub Releases and download/apply the latest Gateway update |
 | `sshhub-ctl update --check` | Check if a newer version is available without applying it |

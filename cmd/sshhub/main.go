@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Trickhish/sshhub/internal/admin"
 	"github.com/Trickhish/sshhub/internal/config"
 	"github.com/Trickhish/sshhub/internal/control"
 	"github.com/Trickhish/sshhub/internal/hubtls"
@@ -80,6 +81,15 @@ func main() {
 		log.Printf("auto-update: releases install once %s old (auto_update_wait)", wait)
 	}
 	hubupdate.StartAutoUpdater(6*time.Hour, wait)
+
+	// Local read-only status socket for sshhub-ctl. Failure here is not fatal:
+	// losing operator visibility should not take the gateway down.
+	adminSrv := admin.NewServer(registry)
+	go func() {
+		if err := adminSrv.ListenAndServe(ctx, admin.DefaultSocketPath); err != nil {
+			log.Printf("admin socket unavailable: %v", err)
+		}
+	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
