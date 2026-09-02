@@ -205,3 +205,28 @@ func TestSoak_UrgentCannotOverrideDisabled(t *testing.T) {
 		t.Fatal("SECURITY: an urgent release overrode the operator's disabled setting")
 	}
 }
+
+// Polling frequently must NOT shorten the soak: a young release stays
+// uninstalled no matter how often it is checked.
+func TestSoak_FrequentPollingDoesNotShortenTheWait(t *testing.T) {
+	installed := ""
+	for i := 0; i < 50; i++ {
+		if applyIfDueWith(48*time.Hour,
+			checker("v0.5.0", 2*time.Hour), // still young
+			func(tag string) error { installed = tag; return nil },
+			func() string { return "0.4.1" }) {
+			t.Fatalf("poll %d installed a release still inside its soak period", i)
+		}
+	}
+	if installed != "" {
+		t.Fatalf("repeated polling installed %q despite the soak", installed)
+	}
+}
+
+// The effective poll interval must be the shorter of the two, so an urgent
+// release is not delayed by a slow caller-supplied cadence.
+func TestUrgentCheckIntervalIsShort(t *testing.T) {
+	if UrgentCheckInterval > 15*time.Minute {
+		t.Errorf("UrgentCheckInterval %s is too slow for an urgent release", UrgentCheckInterval)
+	}
+}

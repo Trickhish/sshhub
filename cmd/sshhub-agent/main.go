@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Trickhish/sshhub/internal/control"
 	"github.com/Trickhish/sshhub/internal/hubtls"
@@ -69,30 +70,102 @@ func main() {
 		log.Fatalf("agent host key: %v", err)
 	}
 
-	session, assignedBackend, err := control.ConnectWithHostKey(
-		ctx, *hub, *backend, *token, agentServer.HostKey(), tlsConfig)
-	if err != nil {
-		log.Fatalf("connect: %v", err)
-	}
-	log.Printf("registered backend %q with %s", assignedBackend, *hub)
+	// Independent update check, in addition to the hub telling us at
+	// registration. The registration path only fires when the HUB restarts, so
+	// on its own it would leave agents stale if the hub stopped updating.
+	control.StartAgentAutoUpdater(ctx)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
+		log.Print("shutting down")
 		cancel()
-		session.Close()
 	}()
 
-	if *sshd != "" {
-		log.Printf("bridging reverse streams to local sshd %s", *sshd)
-		if err := control.Serve(ctx, session, *sshd); err != nil {
-			log.Fatalf("serve sshd bridge: %v", err)
+	run(ctx, cancel, agentServer, tlsConfig, *hub, *backend, *token, *sshd)
+}
+
+// run keeps the agent connected to the hub, reconnecting with backoff.
+//
+// The agent previously exited on any connection or serving error and relied on
+// systemd's Restart=always to bring it back. That works, but it makes normal,
+// expected conditions -- a hub restart, a brief network partition -- into
+// process crashes, and it means the agent only survives where the supervisor is
+// configured correctly. A hub that is down for maintenance should not require
+// the supervisor to paper over it.
+func run(ctx context.Context, cancel context.CancelFunc, agentServer *control.AgentServer,
+	tlsConfig *tls.Config, hub, backend, token, sshd string) {
+
+	const (
+		minBackoff = 2 * time.Second
+		maxBackoff = 60 * time.Second
+	)
+	backoff := minBackoff
+	loggedDown := false
+
+	for {
+		if ctx.Err() != nil {
+			return
 		}
-	} else {
-		log.Printf("serving native PTY sessions on agent")
-		if err := agentServer.ServeStreams(ctx, session); err != nil {
-			log.Fatalf("serve native sessions: %v", err)
+
+		session, assigned, err := control.ConnectWithHostKey(
+			ctx, hub, backend, token, agentServer.HostKey(), tlsConfig)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// Log the first failure at full volume, then stay quiet while the
+			// hub is down so an outage does not fill the journal.
+			if !loggedDown {
+				log.Printf("cannot reach hub %s: %v (retrying every %s until it returns)", hub, err, backoff)
+				loggedDown = true
+			}
+			if !sleepCtx(ctx, backoff) {
+				return
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
 		}
+
+		log.Printf("registered backend %q with %s", assigned, hub)
+		backoff = minBackoff
+		loggedDown = false
+
+		// Serve until the tunnel drops, then reconnect.
+		if sshd != "" {
+			err = control.Serve(ctx, session, sshd)
+		} else {
+			err = agentServer.ServeStreams(ctx, session)
+		}
+		session.Close()
+
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Printf("connection to hub lost: %v; reconnecting", err)
+		} else {
+			log.Print("connection to hub closed; reconnecting")
+		}
+
+		if !sleepCtx(ctx, minBackoff) {
+			return
+		}
+	}
+}
+
+// sleepCtx waits for d, returning false if the context is cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }

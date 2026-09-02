@@ -3,10 +3,14 @@ package control
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Trickhish/sshhub/internal/hubupdate"
+	"github.com/Trickhish/sshhub/internal/version"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -199,4 +203,52 @@ func copyFile(src, dst string) error {
 
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// AgentUpdateCheckInterval is how often a connected agent independently checks
+// for a newer release.
+const AgentUpdateCheckInterval = 30 * time.Minute
+
+// StartAgentAutoUpdater periodically checks for a newer release and applies it.
+//
+// This is a SECOND, independent path to the hub telling the agent at
+// registration. That primary path relies on the hub restarting (which drops the
+// tunnel, so systemd restarts the agent and it re-registers). It works, but it
+// only fires when the hub itself updates: a hub with auto-updates disabled,
+// pinned to a version, or whose own update keeps failing would leave every
+// agent stale indefinitely, including through a security fix.
+//
+// Checking directly removes that dependency. Agents deliberately do NOT honour
+// the hub's auto_update_wait: that soak protects the hub, whose failure takes
+// down every node at once. An agent failure affects one node, so agents favour
+// applying fixes promptly.
+//
+// A nil or already-cancelled ctx stops the loop.
+func StartAgentAutoUpdater(ctx context.Context) {
+	go func() {
+		// Offset the first check so a fleet of agents restarted together by a
+		// hub restart does not stampede GitHub at the same instant.
+		timer := time.NewTimer(time.Duration(rand.Int63n(int64(2 * time.Minute))))
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+
+			latest, err := hubupdate.FetchLatestVersion()
+			if err == nil && hubupdate.IsNewer(latest, version.Version) {
+				log.Printf("agent: release %s available (running %s); updating", latest, version.Version)
+				if err := DownloadAndApplyGitHubUpdate(latest); err != nil {
+					log.Printf("agent: update failed: %v", err)
+				}
+				// On success the process is replaced and restarted, so this
+				// goroutine does not continue.
+			}
+
+			timer.Reset(AgentUpdateCheckInterval)
+		}
+	}()
 }

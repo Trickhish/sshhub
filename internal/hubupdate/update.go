@@ -353,13 +353,38 @@ func replaceBinary(src, dst string) error {
 // remove the operator's own way back in. A soak period gives a broken release
 // time to be noticed and replaced before it propagates.
 //
+// UrgentCheckInterval is how often the updater looks for a release, so an
+// urgent fix is picked up promptly.
+//
+// The check is a single conditional GET against the releases endpoint, which is
+// cheap enough to run often. A slow interval would blunt the urgent flag: with
+// a 6h poll a critical fix could sit unapplied for 6h on every hub, which
+// defeats the point of marking it urgent at all.
+const UrgentCheckInterval = 5 * time.Minute
+
+// StartAutoUpdater periodically checks for a newer release and applies it.
+//
+// It polls at UrgentCheckInterval so an urgent release is applied quickly, but
+// a non-urgent release is still held until it has aged past soak. Polling
+// frequently therefore does not shorten the soak period; it only shortens the
+// delay once a release becomes eligible.
+//
 // A soak of 0 means install as soon as a release is seen. A negative soak
 // (Disabled) switches automatic updates off entirely: no polling goroutine is
 // started, so the hub makes no outbound release requests at all.
+//
+// interval is retained for callers that want a slower cadence; the effective
+// poll is whichever is shorter.
 func StartAutoUpdater(interval, soak time.Duration) {
 	if soak < 0 {
 		return
 	}
+
+	poll := interval
+	if UrgentCheckInterval < poll {
+		poll = UrgentCheckInterval
+	}
+
 	go func() {
 		// Initial check 10 seconds after start
 		time.Sleep(10 * time.Second)
@@ -367,7 +392,7 @@ func StartAutoUpdater(interval, soak time.Duration) {
 			if applyIfDue(soak) {
 				return
 			}
-			time.Sleep(interval)
+			time.Sleep(poll)
 		}
 	}()
 }
