@@ -3,10 +3,8 @@ package e2e
 import (
 	"context"
 	"crypto/x509"
-	"net"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/Trickhish/sshhub/internal/control"
 	"github.com/Trickhish/sshhub/internal/hubtls"
@@ -77,32 +75,4 @@ func TestAgentRefusesWrongPin(t *testing.T) {
 	} else {
 		t.Logf("correctly refused: %v", err)
 	}
-}
-
-// freePort reserves an ephemeral port and returns it, so parallel runs do not
-// collide on a hardcoded number.
-func freePort(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-	return addr
-}
-
-// waitListening blocks until addr accepts connections, avoiding a fixed sleep.
-func waitListening(t *testing.T, addr string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
-		if err == nil {
-			c.Close()
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("listener %s never came up", addr)
 }

@@ -327,12 +327,21 @@ func (s *Server) handleDirectTCPIP(serverConn *ssh.ServerConn, newCh ssh.NewChan
 		return
 	}
 
-	// If the client named a destination, it must resolve to the same backend it
-	// was authorized for.
-	if requested, ok := s.resolveBackendHint(serverConn.User(), payload.DestAddr); ok {
+	// If the client named a destination, it must resolve to the SAME backend it
+	// was authorized for. This fails closed: a destination that resolves to
+	// nothing is refused rather than silently tunnelled to the authorized
+	// backend, which would let any unroutable name through the check.
+	if dest := strings.TrimSpace(payload.DestAddr); dest != "" {
+		requested, ok := s.resolveBackendHint(serverConn.User(), dest)
+		if !ok {
+			log.Printf("ssh: direct-tcpip: unroutable destination %q from client authorized for %q",
+				dest, backendID)
+			newCh.Reject(ssh.Prohibited, "sshhub: destination not authorized")
+			return
+		}
 		if requested.BackendID != backendID {
 			log.Printf("ssh: direct-tcpip: client authorized for %q attempted %q (dest %q)",
-				backendID, requested.BackendID, payload.DestAddr)
+				backendID, requested.BackendID, dest)
 			newCh.Reject(ssh.Prohibited, "sshhub: destination not authorized")
 			return
 		}
@@ -550,10 +559,21 @@ func (s *Server) resolveBackendHint(loginUser, hint string) (resolution, bool) {
 		if b := s.cfg.BackendByID(host); b != nil {
 			return s.fromBackendID(b.ID), true
 		}
+
+		// The destination is authoritative when one was supplied: fall through to
+		// login-based resolution and an unroutable host silently resolves to
+		// whatever the login maps to, so any destination would appear valid and
+		// the caller's cross-backend check could never fire.
+		return resolution{}, false
 	}
 
 	if req.Hostname != "" {
 		if r, ok := s.router.ResolveRoute(req); ok {
+			return s.fromRoute(r), true
+		}
+		// Also try the hostname alone, so a route matching only the host still
+		// supplies its end_user before falling back to the backend-id shortcut.
+		if r, ok := s.router.ResolveRoute(routing.Request{Username: "*", Hostname: req.Hostname}); ok {
 			return s.fromRoute(r), true
 		}
 		if b := s.cfg.BackendByID(req.Hostname); b != nil {
@@ -561,14 +581,18 @@ func (s *Server) resolveBackendHint(loginUser, hint string) (resolution, bool) {
 		}
 	}
 
-	if b := s.cfg.BackendByID(req.Username); b != nil {
-		return s.fromBackendID(b.ID), true
-	}
+	// A bare login that names a backend ("ssh node1@hub"). Consult routes FIRST:
+	// matching the backend id directly used to short-circuit here and return the
+	// default end user, silently ignoring a route's end_user and running the
+	// session as root.
 	if r, ok := s.router.ResolveRoute(routing.Request{Username: "*", Hostname: req.Username}); ok {
 		return s.fromRoute(r), true
 	}
 	if r, ok := s.router.ResolveRoute(req); ok {
 		return s.fromRoute(r), true
+	}
+	if b := s.cfg.BackendByID(req.Username); b != nil {
+		return s.fromBackendID(b.ID), true
 	}
 
 	return resolution{}, false
