@@ -3,6 +3,7 @@ package hubupdate
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Trickhish/sshhub/internal/release"
 	"github.com/Trickhish/sshhub/internal/version"
 )
 
@@ -221,6 +223,13 @@ func DownloadAndApplyHubUpdate(targetVersion string) error {
 		downloadURL = fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", githubRepo, assetName)
 	}
 
+	// Fetch and verify the signed manifest BEFORE downloading the artifact, so
+	// an unsigned or untrusted release is refused without executing anything.
+	manifest, err := fetchVerifiedManifest(client, tag)
+	if err != nil {
+		return err
+	}
+
 	log.Printf("hub: downloading update from %s...", downloadURL)
 	req, err := http.NewRequest("GET", downloadURL, nil)
 	if err != nil {
@@ -237,7 +246,24 @@ func DownloadAndApplyHubUpdate(targetVersion string) error {
 		return fmt.Errorf("github HTTP %d for %s", resp.StatusCode, downloadURL)
 	}
 
-	gzReader, err := gzip.NewReader(resp.Body)
+	// Buffer the artifact so its digest can be checked against the signed
+	// manifest before a single byte is extracted to disk.
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxArtifactBytes))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", downloadURL, err)
+	}
+	if len(payload) == int(maxArtifactBytes) {
+		return fmt.Errorf("release artifact exceeds %d bytes", maxArtifactBytes)
+	}
+
+	if manifest != nil {
+		if err := release.VerifyArtifact(manifest, assetName, payload); err != nil {
+			return fmt.Errorf("refusing update: %w", err)
+		}
+		log.Printf("hub: verified signature and digest for %s", assetName)
+	}
+
+	gzReader, err := gzip.NewReader(bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("read gzip: %w", err)
 	}
@@ -373,6 +399,33 @@ func applyIfDue(soak time.Duration) bool {
 	return applyIfDueWith(soak, defaultChecker, DownloadAndApplyHubUpdate, currentVersion)
 }
 
+// urgentLookup reports whether a release is marked urgent in its SIGNED
+// manifest. Overridable in tests.
+var urgentLookup = signedUrgentFromManifest
+
+// signedUrgent reports whether the release carries a signature-verified urgent
+// marker.
+func signedUrgent(tag string) (bool, string) {
+	return urgentLookup(tag)
+}
+
+func signedUrgentFromManifest(tag string) (bool, string) {
+	m, err := LatestManifest(tag)
+	if err != nil || m == nil {
+		// Unverifiable means NOT urgent: an attacker who can serve a manifest but
+		// not sign it must not be able to bypass the soak.
+		return false, ""
+	}
+	if !m.Urgent {
+		return false, ""
+	}
+	reason := m.UrgentReason
+	if reason == "" {
+		reason = "no reason given"
+	}
+	return true, reason
+}
+
 func currentVersion() string { return version.Version }
 
 func applyIfDueWith(soak time.Duration, check updateChecker, install updateInstaller, current func() string) bool {
@@ -393,16 +446,26 @@ func applyIfDueWith(soak time.Duration, check updateChecker, install updateInsta
 	}
 
 	if soak > 0 {
-		if published.IsZero() {
-			// Fail closed: without a publication time the soak period cannot be
-			// honoured, and installing anyway would silently defeat it.
-			log.Printf("hub: release %s has no publication time; deferring update", latest)
-			return false
-		}
-		if age := time.Since(published); age < soak {
-			log.Printf("hub: release %s is %s old, waiting until it is %s old before updating",
-				latest, age.Round(time.Minute), soak)
-			return false
+		// An urgent release may bypass the soak, but ONLY when the flag comes
+		// from a signature-verified manifest. Otherwise anyone able to publish a
+		// release could set it and defeat the operator's safety delay -- exactly
+		// what the delay exists to prevent.
+		urgent, reason := signedUrgent(latest)
+		if urgent {
+			log.Printf("hub: release %s is marked URGENT by the release signing key (%s); "+
+				"bypassing the %s auto_update_wait", latest, reason, soak)
+		} else {
+			if published.IsZero() {
+				// Fail closed: without a publication time the soak period cannot be
+				// honoured, and installing anyway would silently defeat it.
+				log.Printf("hub: release %s has no publication time; deferring update", latest)
+				return false
+			}
+			if age := time.Since(published); age < soak {
+				log.Printf("hub: release %s is %s old, waiting until it is %s old before updating",
+					latest, age.Round(time.Minute), soak)
+				return false
+			}
 		}
 	}
 
@@ -415,4 +478,71 @@ func applyIfDueWith(soak time.Duration, check updateChecker, install updateInsta
 	log.Printf("hub: update applied. Restarting sshhub service...")
 	_ = exec.Command("systemctl", "restart", "sshhub").Run()
 	return true
+}
+
+// maxArtifactBytes bounds how much is buffered for digest verification, so a
+// hostile or corrupted response cannot exhaust memory.
+const maxArtifactBytes = 256 << 20 // 256 MiB
+
+// manifestAssetName is the signed manifest published alongside the binaries.
+const manifestAssetName = "sshhub-manifest.json"
+
+// fetchVerifiedManifest downloads and verifies the release's signed manifest.
+//
+// It returns (nil, nil) when this build has no compiled-in signing key AND does
+// not require one -- a locally built binary updating from a private build.
+// Official builds set RequireSignature, so for them a missing or invalid
+// manifest is a hard failure and the update is refused.
+func fetchVerifiedManifest(client *http.Client, tag string) (*release.Manifest, error) {
+	trusted, haveKey := release.TrustedKey()
+	if !haveKey {
+		if release.SignatureRequired() {
+			return nil, fmt.Errorf("refusing update: this build requires signed releases " +
+				"but has no trusted release key compiled in")
+		}
+		log.Printf("hub: WARNING: no release signing key compiled in; update will NOT be verified")
+		return nil, nil
+	}
+
+	var url string
+	if tag != "" {
+		url = fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", githubRepo, tag, manifestAssetName)
+	} else {
+		url = fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", githubRepo, manifestAssetName)
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "sshhub-updater")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("refusing update: cannot fetch release manifest: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("refusing update: release manifest unavailable (HTTP %d). "+
+			"A release without a signed manifest cannot be verified", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("refusing update: read manifest: %w", err)
+	}
+
+	m, err := release.Verify(data, trusted)
+	if err != nil {
+		return nil, fmt.Errorf("refusing update: %w", err)
+	}
+	return m, nil
+}
+
+// LatestManifest returns the verified manifest for the latest release, or nil
+// if this build cannot verify signatures. Used to consult the signed urgent
+// flag before applying the operator's soak period.
+func LatestManifest(tag string) (*release.Manifest, error) {
+	return fetchVerifiedManifest(newHTTPClient(30*time.Second), tag)
 }

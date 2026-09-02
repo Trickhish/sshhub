@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      urgent_reason:
+        description: >-
+          Mark this release URGENT so hubs install it immediately, bypassing
+          their configured auto_update_wait. Only for fixes that must not wait
+          (e.g. an authentication bypass). Leave empty for a normal release.
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -34,6 +43,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
         run: |
           # Inject the tag as the version. Without this the binaries report the
           # hardcoded fallback, the hub compares equal versions, and no agent is
@@ -41,6 +51,15 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "Building version ${VERSION}"
           LDFLAGS="-s -w -X github.com/Trickhish/sshhub/internal/version.Version=${VERSION}"
+          # Compile in the release signing key so binaries verify future
+          # updates. RequireSignature makes an unverifiable update a hard
+          # failure rather than a warning.
+          if [ -n "${RELEASE_PUBLIC_KEY}" ]; then
+            LDFLAGS="$LDFLAGS -X github.com/Trickhish/sshhub/internal/release.TrustedPublicKey=${RELEASE_PUBLIC_KEY}"
+            LDFLAGS="$LDFLAGS -X github.com/Trickhish/sshhub/internal/release.RequireSignature=true"
+          else
+            echo "::warning::RELEASE_PUBLIC_KEY is not set; binaries will not verify update signatures"
+          fi
           go build -ldflags="$LDFLAGS" -o dist/sshhub ./cmd/sshhub
           go build -ldflags="$LDFLAGS" -o dist/sshhub-agent ./cmd/sshhub-agent
           go build -ldflags="$LDFLAGS" -o dist/sshhub-ctl ./cmd/sshhub-ctl
@@ -83,6 +102,32 @@ jobs:
         with:
           path: dist-release
           merge-multiple: true
+
+      # Signs the manifest covering every artifact. Hubs and agents verify this
+      # before installing an update, so publishing a release is not by itself
+      # enough to ship code -- the signing key is required too.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Sign Release Manifest
+        env:
+          SSHHUB_SIGNING_KEY: ${{ secrets.SSHHUB_SIGNING_KEY }}
+          URGENT_REASON: ${{ github.event.inputs.urgent_reason }}
+        run: |
+          if [ -z "${SSHHUB_SIGNING_KEY}" ]; then
+            echo "::error::SSHHUB_SIGNING_KEY is not set; refusing to publish an unsigned release."
+            echo "Clients built with RequireSignature will refuse to install it."
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          go build -o /tmp/sshhub-sign ./cmd/sshhub-sign
+          if [ -n "${URGENT_REASON}" ]; then
+            /tmp/sshhub-sign manifest --version "${VERSION}" --dir dist-release --urgent "${URGENT_REASON}"
+          else
+            /tmp/sshhub-sign manifest --version "${VERSION}" --dir dist-release
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

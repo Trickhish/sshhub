@@ -150,3 +150,58 @@ func TestSoak_DisabledStartsNoGoroutine(t *testing.T) {
 		t.Errorf("disabled updater started %d goroutine(s)", after-before)
 	}
 }
+
+// A signed urgent marker bypasses the soak period.
+func TestSoak_SignedUrgentBypassesWait(t *testing.T) {
+	orig := urgentLookup
+	defer func() { urgentLookup = orig }()
+	urgentLookup = func(tag string) (bool, string) { return true, "critical auth bypass" }
+
+	installed := ""
+	ok := applyIfDueWith(48*time.Hour,
+		checker("v0.5.0", 1*time.Minute), // brand new
+		func(tag string) error { installed = tag; return nil },
+		func() string { return "0.4.1" })
+
+	if !ok || installed != "v0.5.0" {
+		t.Fatalf("a signed urgent release should bypass the soak (ok=%v installed=%q)", ok, installed)
+	}
+}
+
+// SECURITY: if the urgent marker cannot be signature-verified it must NOT
+// bypass the soak. Otherwise anyone able to publish a release could defeat the
+// operator's safety delay.
+func TestSoak_UnverifiedUrgentDoesNotBypassWait(t *testing.T) {
+	orig := urgentLookup
+	defer func() { urgentLookup = orig }()
+	// Verification failed, so no urgent claim is honoured.
+	urgentLookup = func(tag string) (bool, string) { return false, "" }
+
+	installed := ""
+	ok := applyIfDueWith(48*time.Hour,
+		checker("v0.5.0", 1*time.Minute),
+		func(tag string) error { installed = tag; return nil },
+		func() string { return "0.4.1" })
+
+	if ok || installed != "" {
+		t.Fatal("SECURITY: an unverified urgent claim bypassed the soak period")
+	}
+}
+
+// Urgent must not override a disabled updater: disabling is the operator's
+// decision and no release may overrule it.
+func TestSoak_UrgentCannotOverrideDisabled(t *testing.T) {
+	orig := urgentLookup
+	defer func() { urgentLookup = orig }()
+	urgentLookup = func(tag string) (bool, string) { return true, "critical" }
+
+	installed := ""
+	ok := applyIfDueWith(-1,
+		checker("v0.5.0", time.Minute),
+		func(tag string) error { installed = tag; return nil },
+		func() string { return "0.4.1" })
+
+	if ok || installed != "" {
+		t.Fatal("SECURITY: an urgent release overrode the operator's disabled setting")
+	}
+}

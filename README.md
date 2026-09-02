@@ -253,9 +253,10 @@ SSHub is built with defense-in-depth:
    - Agents connect over TLS and authenticate the Hub by **public key pin** (`--hub-pin`), so registration tokens cannot be captured on-path.
    - The Hub pins each agent's SSH host key, and refuses to connect to a backend whose key it does not know.
 
-4. **Supply Chain Protection on Auto-Updates**:
-   - `sshhub-agent` updates exclusively from **GitHub Releases over verified TLS/HTTPS**.
-   - The Hub never distributes raw binaries or private keys. A compromised Hub cannot inject arbitrary malicious code onto connected nodes.
+4. **Signed Releases**:
+   - Every release publishes a manifest listing each artifact's SHA-256 digest, signed with an **offline Ed25519 release key**. Hubs and agents verify the signature and the digest before installing, and refuse the update on any mismatch.
+   - Publishing a release is therefore *not* sufficient to ship code: the signing key is required as well, and it never exists on a hub, on an agent, or in a workflow that can publish releases.
+   - Updates are fetched from **GitHub Releases over TLS**. The Hub never distributes binaries, so a compromised Hub cannot inject code onto connected nodes.
 
 5. **Abuse Resistance**:
    - Per-source-IP connection rate limiting, a concurrent-handshake cap, and temporary blocking after repeated authentication failures.
