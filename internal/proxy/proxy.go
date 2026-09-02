@@ -66,30 +66,38 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 	}
 
 	sshConfig := &ssh.ServerConfig{
-		MaxAuthTries: 6,
+		// OpenSSH offers every key in the user's agent in turn, so this bounds
+		// how many keys a client may carry, not how many guesses an attacker
+		// gets. Set to 6 it disconnected anyone with a well-populated agent
+		// before their authorized key was reached. Brute force is bounded by the
+		// per-source rate limiter, which counts connections, so this can be
+		// generous without weakening that.
+		MaxAuthTries: 24,
 
 		// Public-key only. The hub verifies the client's key WITH THE AGENT
 		// (which checks the backend's authorized_keys) and fails closed on any
 		// error. The hub asserts no identity of its own and holds no key that
 		// authenticates to a backend.
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			// Every rejection below counts as a failure, so enumerating routes or
-			// backend names is throttled just like guessing keys.
+			// NOTE: individual key offers are deliberately NOT counted as
+			// failures. OpenSSH offers every key in the user's agent in turn, so
+			// a normal client with a populated agent produces several rejections
+			// before presenting the right one. Counting each offer exhausted the
+			// failure budget in one or two legitimate connections and blocked the
+			// user for BlockDuration. Failures are counted once per connection,
+			// in Handle, only when the whole handshake fails.
 			res, ok := s.resolveBackend(conn.User())
 			if !ok {
-				s.limiter.RecordFailure(conn.RemoteAddr())
 				return nil, fmt.Errorf("no route for user %q", conn.User())
 			}
 			backend := s.cfg.BackendByID(res.BackendID)
 			if backend == nil {
-				s.limiter.RecordFailure(conn.RemoteAddr())
 				return nil, fmt.Errorf("backend %q not found", res.BackendID)
 			}
 
 			// Delegate authorization to the backend agent in real time. The agent
 			// checks the key against end_user's authorized_keys on the node.
 			if err := s.verifyBackendAgentKey(backend, res.EndUser, key); err != nil {
-				s.limiter.RecordFailure(conn.RemoteAddr())
 				return nil, fmt.Errorf("unauthorized key for backend %s", res.BackendID)
 			}
 			s.limiter.RecordSuccess(conn.RemoteAddr())
@@ -186,6 +194,10 @@ func (s *Server) Handle(conn net.Conn) {
 
 	serverConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
 	if err != nil {
+		// One failure per CONNECTION, not per key offered. A client with several
+		// keys in its agent legitimately produces multiple rejected offers within
+		// a single handshake.
+		s.limiter.RecordFailure(conn.RemoteAddr())
 		log.Printf("ssh: handshake failed from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
