@@ -6,6 +6,10 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Existing tag to release, e.g. v0.5.0"
+        required: true
+        type: string
       urgent_reason:
         description: >-
           Mark this release URGENT so hubs install it immediately, bypassing
@@ -32,6 +36,17 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          # On workflow_dispatch GITHUB_REF_NAME is the BRANCH, not a tag, so
+          # the tag input is authoritative when present.
+          REF="${{ inputs.tag || github.ref_name }}"
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+          echo "Releasing version ${REF#v}"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -48,7 +63,7 @@ jobs:
           # Inject the tag as the version. Without this the binaries report the
           # hardcoded fallback, the hub compares equal versions, and no agent is
           # ever told to update -- a silent no-op release.
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.ver.outputs.version }}"
           echo "Building version ${VERSION}"
           LDFLAGS="-s -w -X github.com/Trickhish/sshhub/internal/version.Version=${VERSION}"
           # Compile in the release signing key so binaries verify future
@@ -66,7 +81,7 @@ jobs:
 
       - name: Verify version was injected
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.ver.outputs.version }}"
           if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "amd64" ]; then
             got="$(./dist/sshhub-ctl version | awk '{print $NF}')"
             if [ "$got" != "$VERSION" ]; then
@@ -96,6 +111,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Download All Build Artifacts
         uses: actions/download-artifact@v4
@@ -121,7 +138,8 @@ jobs:
             echo "Clients built with RequireSignature will refuse to install it."
             exit 1
           fi
-          VERSION="${GITHUB_REF_NAME#v}"
+          REF="${{ inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
           go build -o /tmp/sshhub-sign ./cmd/sshhub-sign
           if [ -n "${URGENT_REASON}" ]; then
             /tmp/sshhub-sign manifest --version "${VERSION}" --dir dist-release --urgent "${URGENT_REASON}"
@@ -132,6 +150,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist-release/*
           generate_release_notes: true
         env:
