@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 
+	"github.com/Trickhish/sshhub/internal/hubupdate"
 	"github.com/Trickhish/sshhub/internal/version"
 	"github.com/hashicorp/yamux"
 )
@@ -115,7 +116,11 @@ func (s *Server) register(session *yamux.Session) (backendID string, hostKey str
 		return "", "", &RegistrationError{Message: "invalid token"}
 	}
 
-	updateAvailable := req.Version != "" && req.Version != version.Version
+	// Only advertise an update when the hub is strictly NEWER. A plain
+	// inequality also fires when the agent is ahead of the hub, telling it to
+	// "update" to an older build -- which during a staged rollout would
+	// downgrade an already-updated agent.
+	updateAvailable := req.Version != "" && hubupdate.IsNewer(version.Version, req.Version)
 
 	resp := RegisterResponse{
 		OK:              true,

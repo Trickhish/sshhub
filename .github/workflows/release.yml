@@ -35,9 +35,27 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          go build -ldflags="-s -w" -o dist/sshhub ./cmd/sshhub
-          go build -ldflags="-s -w" -o dist/sshhub-agent ./cmd/sshhub-agent
-          go build -ldflags="-s -w" -o dist/sshhub-ctl ./cmd/sshhub-ctl
+          # Inject the tag as the version. Without this the binaries report the
+          # hardcoded fallback, the hub compares equal versions, and no agent is
+          # ever told to update -- a silent no-op release.
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Building version ${VERSION}"
+          LDFLAGS="-s -w -X github.com/Trickhish/sshhub/internal/version.Version=${VERSION}"
+          go build -ldflags="$LDFLAGS" -o dist/sshhub ./cmd/sshhub
+          go build -ldflags="$LDFLAGS" -o dist/sshhub-agent ./cmd/sshhub-agent
+          go build -ldflags="$LDFLAGS" -o dist/sshhub-ctl ./cmd/sshhub-ctl
+
+      - name: Verify version was injected
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "amd64" ]; then
+            got="$(./dist/sshhub-ctl version | awk '{print $NF}')"
+            if [ "$got" != "$VERSION" ]; then
+              echo "version injection failed: binary reports '$got', tag is '$VERSION'" >&2
+              exit 1
+            fi
+            echo "verified: binary reports $got"
+          fi
 
       - name: Package Release Archives
         run: |

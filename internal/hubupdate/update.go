@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,13 +110,53 @@ func FetchLatestVersion() (string, error) {
 }
 
 // IsNewer compares two semantic versions (e.g. "v0.3.0" > "0.2.0").
+// IsNewer reports whether latest is strictly newer than current, comparing
+// dotted numeric components (e.g. "0.10.0" > "0.9.1").
+//
+// It previously returned latest != current, which also reported true when
+// latest was OLDER -- causing a downgrade to be advertised as an update.
 func IsNewer(latest, current string) bool {
 	latest = strings.TrimPrefix(strings.TrimSpace(latest), "v")
 	current = strings.TrimPrefix(strings.TrimSpace(current), "v")
 	if latest == "" || current == "" {
 		return false
 	}
-	return latest != current
+	return compareVersions(latest, current) > 0
+}
+
+// compareVersions returns >0 if a is newer than b, <0 if older, 0 if equal.
+//
+// Any pre-release suffix ("1.2.3-rc1") is ignored for ordering; only the
+// numeric components are compared. Non-numeric components sort as 0, so a
+// malformed version is never treated as newer than a valid one.
+func compareVersions(a, b string) int {
+	// Drop pre-release/build metadata.
+	a = strings.SplitN(a, "-", 2)[0]
+	b = strings.SplitN(b, "-", 2)[0]
+
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+
+	n := len(as)
+	if len(bs) > n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		av, bv := 0, 0
+		if i < len(as) {
+			av, _ = strconv.Atoi(as[i])
+		}
+		if i < len(bs) {
+			bv, _ = strconv.Atoi(bs[i])
+		}
+		if av != bv {
+			if av > bv {
+				return 1
+			}
+			return -1
+		}
+	}
+	return 0
 }
 
 // DownloadAndApplyHubUpdate downloads the latest sshhub and sshhub-ctl release binaries
