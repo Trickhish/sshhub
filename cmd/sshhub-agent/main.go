@@ -20,6 +20,8 @@ func main() {
 	token := flag.String("token", "", "control plane token")
 	backend := flag.String("backend", "", "optional backend id override")
 	sshd := flag.String("sshd", "", "optional local sshd address to bridge to (if omitted, agent serves sessions natively)")
+	hostKeyPath := flag.String("host-key", control.DefaultHostKeyPath,
+		"path to the agent's persistent SSH host key")
 	pin := flag.String("hub-pin", "", "hub public key pin (sha256:...) shown by 'sshhub-ctl add'")
 	insecure := flag.Bool("insecure-no-pin", false,
 		"connect without verifying the hub's identity (TESTING ONLY: exposes the token to interception)")
@@ -60,7 +62,15 @@ func main() {
 		tlsConfig = cfg
 	}
 
-	session, assignedBackend, err := control.Connect(ctx, *hub, *backend, *token, tlsConfig)
+	// Create the agent server first so its persistent host key can be advertised
+	// at registration for the hub to pin.
+	agentServer, err := control.NewAgentServerWithHostKey(*hostKeyPath)
+	if err != nil {
+		log.Fatalf("agent host key: %v", err)
+	}
+
+	session, assignedBackend, err := control.ConnectWithHostKey(
+		ctx, *hub, *backend, *token, agentServer.HostKey(), tlsConfig)
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}
@@ -81,10 +91,6 @@ func main() {
 		}
 	} else {
 		log.Printf("serving native PTY sessions on agent")
-		agentServer, err := control.NewAgentServer()
-		if err != nil {
-			log.Fatalf("create agent server: %v", err)
-		}
 		if err := agentServer.ServeStreams(ctx, session); err != nil {
 			log.Fatalf("serve native sessions: %v", err)
 		}

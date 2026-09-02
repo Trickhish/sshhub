@@ -69,7 +69,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	backend, err := s.register(session)
+	backend, hostKey, err := s.register(session)
 	if err != nil {
 		log.Printf("control: %v", err)
 		session.Close()
@@ -79,7 +79,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	// A second agent presenting the same token must not silently displace or
 	// shadow the first: previously this error was discarded, so the hub logged
 	// "connected" for a session that was never in the registry.
-	if err := s.registry.register(backend, session); err != nil {
+	if err := s.registry.registerWithHostKey(backend, session, hostKey); err != nil {
 		log.Printf("control: refusing registration for %q: %v", backend, err)
 		session.Close()
 		return
@@ -93,26 +93,26 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 // register waits for the agent's registration stream and validates it.
-func (s *Server) register(session *yamux.Session) (string, error) {
+func (s *Server) register(session *yamux.Session) (backendID string, hostKey string, err error) {
 	stream, err := session.AcceptStream()
 	if err != nil {
-		return "", fmt.Errorf("accept registration stream: %w", err)
+		return "", "", fmt.Errorf("accept registration stream: %w", err)
 	}
 	defer stream.Close()
 
 	req, err := ReadRegister(stream)
 	if err != nil {
-		return "", fmt.Errorf("read register request: %w", err)
+		return "", "", fmt.Errorf("read register request: %w", err)
 	}
 	if req.Token == "" {
 		WriteResponse(stream, RegisterResponse{OK: false, Error: "token is required"})
-		return "", &RegistrationError{Message: "token is required"}
+		return "", "", &RegistrationError{Message: "token is required"}
 	}
 
 	backendID, ok := s.resolveToken(req.Token, req.Backend)
 	if !ok {
 		WriteResponse(stream, RegisterResponse{OK: false, Error: "invalid token"})
-		return "", &RegistrationError{Message: "invalid token"}
+		return "", "", &RegistrationError{Message: "invalid token"}
 	}
 
 	updateAvailable := req.Version != "" && req.Version != version.Version
@@ -125,8 +125,8 @@ func (s *Server) register(session *yamux.Session) (string, error) {
 	}
 
 	if err := WriteResponse(stream, resp); err != nil {
-		return "", fmt.Errorf("write register response: %w", err)
+		return "", "", fmt.Errorf("write register response: %w", err)
 	}
 
-	return backendID, nil
+	return backendID, req.HostKey, nil
 }

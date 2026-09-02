@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -55,6 +56,7 @@ func writeFile(t *testing.T, dir, name, content string) string {
 type stubAgent struct {
 	cfg     *ssh.ServerConfig
 	allowed string
+	hostKey string
 	// lastEndUser records the end user the hub asserted, so tests can check
 	// that the Unix account came from the route and not from client input.
 	mu          sync.Mutex
@@ -68,7 +70,11 @@ func newStubAgent(t *testing.T, allowed ssh.PublicKey) *stubAgent {
 	// No client auth: authorization happened in the stream header.
 	cfg := &ssh.ServerConfig{NoClientAuth: true}
 	cfg.AddHostKey(hostSigner)
-	return &stubAgent{cfg: cfg, allowed: string(allowed.Marshal())}
+	return &stubAgent{
+		cfg:     cfg,
+		allowed: string(allowed.Marshal()),
+		hostKey: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostSigner.PublicKey()))),
+	}
 }
 
 func (a *stubAgent) EndUser() string {
@@ -173,13 +179,14 @@ func testHub(t *testing.T, allowed ssh.PublicKey, routes []config.Route) string 
 	go controlServer.ListenAndServe(ctx, controlAddr)
 	time.Sleep(50 * time.Millisecond)
 
-	// Stub agent connects to the control plane as backend "cidev".
-	session, _, err := control.Connect(ctx, controlAddr, "cidev", "secret", nil)
+	// Stub agent connects to the control plane as backend "cidev", advertising
+	// its host key so the hub can pin it.
+	agent := newStubAgent(t, allowed)
+	session, _, err := control.ConnectWithHostKey(ctx, controlAddr, "cidev", "secret", agent.hostKey, nil)
 	if err != nil {
 		t.Fatalf("agent connect: %v", err)
 	}
 	t.Cleanup(func() { session.Close() })
-	agent := newStubAgent(t, allowed)
 	go agent.serveStreams(ctx, session)
 
 	// Hub SSH front end.

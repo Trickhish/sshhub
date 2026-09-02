@@ -441,14 +441,62 @@ func (s *Server) dialBackendAgent(backend *config.Backend, endUser string, perms
 		return nil, nil, nil, err
 	}
 
+	hostKeyCallback, err := s.agentHostKeyCallback(backend)
+	if err != nil {
+		rawConn.Close()
+		return nil, nil, nil, err
+	}
+
 	// Authorization is complete; this SSH layer only transports the session.
 	clientConfig := &ssh.ClientConfig{
 		User:            endUser,
 		Auth:            []ssh.AuthMethod{},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback,
 	}
 
 	return ssh.NewClientConn(rawConn, backend.ID, clientConfig)
+}
+
+// agentHostKeyCallback returns the host key policy for dialling a backend
+// agent, in order of preference:
+//
+//  1. host_key / host_key_file from config -- an operator-set pin, strongest.
+//  2. the key the agent advertised at registration -- pinned for the lifetime
+//     of that control session.
+//
+// If neither is available the connection is REFUSED. Accepting any key would
+// mean a compromised control session could substitute a different endpoint.
+func (s *Server) agentHostKeyCallback(backend *config.Backend) (ssh.HostKeyCallback, error) {
+	if backend.HostKey != "" {
+		key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(backend.HostKey))
+		if err != nil {
+			return nil, fmt.Errorf("backend %q host_key: %w", backend.ID, err)
+		}
+		return ssh.FixedHostKey(key), nil
+	}
+
+	if backend.HostKeyFile != "" {
+		data, err := os.ReadFile(backend.HostKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("backend %q host_key_file: %w", backend.ID, err)
+		}
+		key, _, _, _, err := ssh.ParseAuthorizedKey(data)
+		if err != nil {
+			return nil, fmt.Errorf("backend %q host_key_file: %w", backend.ID, err)
+		}
+		return ssh.FixedHostKey(key), nil
+	}
+
+	if advertised := s.registry.HostKey(backend.ID); advertised != "" {
+		key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(advertised))
+		if err != nil {
+			return nil, fmt.Errorf("backend %q advertised an unparsable host key: %w", backend.ID, err)
+		}
+		return ssh.FixedHostKey(key), nil
+	}
+
+	return nil, fmt.Errorf("backend %q has no known host key: upgrade the agent so it "+
+		"advertises one, or pin it with host_key in the config", backend.ID)
 }
 
 // resolution is the outcome of routing a client login to a backend.

@@ -15,7 +15,16 @@ import (
 
 // Connect dials the hub, registers with the given token (and optional backend id),
 // and returns a live session and the backend ID assigned by the hub.
+// Connect dials the hub and registers. hostKey is the agent's SSH host public
+// key in authorized_keys form; the hub pins it so later sessions cannot be
+// served by a different endpoint. It may be empty for callers with no SSH
+// server of their own.
 func Connect(ctx context.Context, hubAddr, backend, token string, tlsConfig *tls.Config) (*yamux.Session, string, error) {
+	return ConnectWithHostKey(ctx, hubAddr, backend, token, "", tlsConfig)
+}
+
+// ConnectWithHostKey is Connect, additionally advertising the agent's host key.
+func ConnectWithHostKey(ctx context.Context, hubAddr, backend, token, hostKey string, tlsConfig *tls.Config) (*yamux.Session, string, error) {
 	var conn net.Conn
 	var err error
 	if tlsConfig != nil {
@@ -38,7 +47,7 @@ func Connect(ctx context.Context, hubAddr, backend, token string, tlsConfig *tls
 		return nil, "", fmt.Errorf("open yamux session: %w", err)
 	}
 
-	assignedBackend, err := register(session, backend, token)
+	assignedBackend, err := register(session, backend, token, hostKey)
 	if err != nil {
 		session.Close()
 		return nil, "", err
@@ -48,7 +57,7 @@ func Connect(ctx context.Context, hubAddr, backend, token string, tlsConfig *tls
 
 // register opens a control stream, sends the registration request, and returns
 // the assigned backend id.
-func register(session *yamux.Session, backend, token string) (string, error) {
+func register(session *yamux.Session, backend, token, hostKey string) (string, error) {
 	stream, err := session.OpenStream()
 	if err != nil {
 		return "", fmt.Errorf("open registration stream: %w", err)
@@ -61,6 +70,7 @@ func register(session *yamux.Session, backend, token string) (string, error) {
 		Version: version.Version,
 		OS:      runtime.GOOS,
 		Arch:    runtime.GOARCH,
+		HostKey: hostKey,
 	}
 
 	if err := WriteRegister(stream, req); err != nil {

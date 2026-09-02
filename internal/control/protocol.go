@@ -19,6 +19,9 @@ type RegisterRequest struct {
 	Version string `json:"version,omitempty"`
 	OS      string `json:"os,omitempty"`
 	Arch    string `json:"arch,omitempty"`
+	// HostKey is the agent's SSH host public key in authorized_keys form. The
+	// hub pins it so a later session cannot be served by a different endpoint.
+	HostKey string `json:"host_key,omitempty"`
 }
 
 // RegisterResponse is the hub's reply to a RegisterRequest.

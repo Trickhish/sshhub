@@ -5,12 +5,14 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,9 +26,17 @@ import (
 // and verifies client public keys against local authorized_keys.
 type AgentServer struct {
 	sshConfig *ssh.ServerConfig
+	hostKey   ssh.Signer
 }
 
+// DefaultHostKeyPath is where the agent persists its SSH host key, giving it a
+// stable identity the hub can pin across restarts.
+const DefaultHostKeyPath = "/var/lib/sshhub/agent_host_key"
+
 // NewAgentServer creates an AgentServer with an ephemeral host key.
+//
+// Prefer NewAgentServerWithHostKey: an ephemeral key changes on every restart,
+// so it cannot be pinned. This constructor remains for tests.
 func NewAgentServer() (*AgentServer, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -36,6 +46,62 @@ func NewAgentServer() (*AgentServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create agent signer: %w", err)
 	}
+	return newAgentServer(signer)
+}
+
+// NewAgentServerWithHostKey creates an AgentServer using a persistent host key
+// loaded from path, generating and storing one if absent.
+func NewAgentServerWithHostKey(path string) (*AgentServer, error) {
+	signer, err := loadOrCreateHostKey(path)
+	if err != nil {
+		return nil, err
+	}
+	return newAgentServer(signer)
+}
+
+// HostKey returns the agent's public host key in authorized_keys form, which
+// the hub records at registration and pins on subsequent connections.
+func (a *AgentServer) HostKey() string {
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(a.hostKey.PublicKey())))
+}
+
+// loadOrCreateHostKey reads an Ed25519 host key from path, creating it if it
+// does not exist. The key file is owner-only.
+func loadOrCreateHostKey(path string) (ssh.Signer, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		signer, err := ssh.ParsePrivateKey(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse agent host key %s: %w", path, err)
+		}
+		return signer, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read agent host key %s: %w", path, err)
+	}
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate agent host key: %w", err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "sshhub-agent")
+	if err != nil {
+		return nil, fmt.Errorf("marshal agent host key: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		return nil, fmt.Errorf("write agent host key: %w", err)
+	}
+
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("create agent signer: %w", err)
+	}
+	return signer, nil
+}
+
+func newAgentServer(signer ssh.Signer) (*AgentServer, error) {
 
 	sshConfig := &ssh.ServerConfig{
 		// Authorization already happened in the stream header (see streamauth.go),
@@ -53,6 +119,7 @@ func NewAgentServer() (*AgentServer, error) {
 
 	return &AgentServer{
 		sshConfig: sshConfig,
+		hostKey:   signer,
 	}, nil
 }
 
