@@ -37,6 +37,7 @@ import (
 
 	"github.com/Trickhish/sshhub/internal/config"
 	"github.com/Trickhish/sshhub/internal/control"
+	"github.com/Trickhish/sshhub/internal/ratelimit"
 	"github.com/Trickhish/sshhub/internal/routing"
 	"golang.org/x/crypto/ssh"
 )
@@ -47,6 +48,7 @@ type Server struct {
 	registry  *control.Registry
 	router    *routing.Router
 	sshConfig *ssh.ServerConfig
+	limiter   *ratelimit.Limiter
 }
 
 // New builds a proxy Server from the hub configuration.
@@ -60,6 +62,7 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 		cfg:      cfg,
 		registry: registry,
 		router:   routing.New(cfg.Routes),
+		limiter:  ratelimit.New(ratelimit.DefaultConfig()),
 	}
 
 	sshConfig := &ssh.ServerConfig{
@@ -70,20 +73,26 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 		// error. The hub asserts no identity of its own and holds no key that
 		// authenticates to a backend.
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			// Every rejection below counts as a failure, so enumerating routes or
+			// backend names is throttled just like guessing keys.
 			res, ok := s.resolveBackend(conn.User())
 			if !ok {
+				s.limiter.RecordFailure(conn.RemoteAddr())
 				return nil, fmt.Errorf("no route for user %q", conn.User())
 			}
 			backend := s.cfg.BackendByID(res.BackendID)
 			if backend == nil {
+				s.limiter.RecordFailure(conn.RemoteAddr())
 				return nil, fmt.Errorf("backend %q not found", res.BackendID)
 			}
 
 			// Delegate authorization to the backend agent in real time. The agent
 			// checks the key against end_user's authorized_keys on the node.
 			if err := s.verifyBackendAgentKey(backend, res.EndUser, key); err != nil {
+				s.limiter.RecordFailure(conn.RemoteAddr())
 				return nil, fmt.Errorf("unauthorized key for backend %s", res.BackendID)
 			}
+			s.limiter.RecordSuccess(conn.RemoteAddr())
 
 			// Record the resolved end user so the session path cannot re-derive a
 			// different (client-influenced) value later.
@@ -154,7 +163,20 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 				return fmt.Errorf("accept: %w", err)
 			}
 		}
-		go s.Handle(conn)
+
+		// Throttle before the handshake: that is the expensive part, and it is
+		// reachable by any unauthenticated peer.
+		reason, release := s.limiter.Acquire(conn.RemoteAddr())
+		if reason != ratelimit.Allowed {
+			log.Printf("ssh: refused %s: %s", conn.RemoteAddr(), reason)
+			conn.Close()
+			continue
+		}
+
+		go func(c net.Conn) {
+			defer release()
+			s.Handle(c)
+		}(conn)
 	}
 }
 
