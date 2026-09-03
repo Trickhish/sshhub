@@ -244,11 +244,27 @@ func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, acct *accoun
 		ptyFile  *os.File
 		cmdMutex sync.Mutex
 		envVars  []string
+		// started is set once a shell/exec request has been accepted, so the
+		// request loop below can refuse further pty-req/env requests (only
+		// valid before the process starts) while continuing to service
+		// window-change for as long as the channel stays open.
+		started bool
 	)
 
+	// The request loop must keep running for the LIFETIME of the channel, not
+	// just until a shell/exec request starts a process. It previously called
+	// runProcess synchronously from inside this loop and returned when it
+	// finished, which meant nothing read from reqs while the process was
+	// running: any window-change sent during an interactive session (resizing
+	// a terminal mid-tmux-session, for example) was never delivered, so the
+	// pty was never resized after the initial one.
 	for req := range reqs {
 		switch req.Type {
 		case "pty-req":
+			if started {
+				req.Reply(false, nil)
+				continue
+			}
 			var p ptyReqPayload
 			if err := ssh.Unmarshal(req.Payload, &p); err == nil {
 				ptyReq = &p
@@ -276,6 +292,10 @@ func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, acct *accoun
 			}
 
 		case "env":
+			if started {
+				req.Reply(false, nil)
+				continue
+			}
 			var env envPayload
 			if err := ssh.Unmarshal(req.Payload, &env); err == nil {
 				envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, env.Value))
@@ -285,22 +305,34 @@ func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, acct *accoun
 			}
 
 		case "shell":
+			if started {
+				req.Reply(false, nil)
+				continue
+			}
+			started = true
 			req.Reply(true, nil)
 			cmd := exec.Command(acct.Shell)
 			prepareCommand(cmd, acct, ptyReq, envVars)
-			runProcess(ch, cmd, ptyReq, &ptyFile, &cmdMutex)
-			return
+			// Run in the background: the request loop above must keep going so
+			// a later window-change still reaches pty.Setsize via ptyFile/
+			// cmdMutex, which runProcess populates before it starts copying.
+			go runProcess(ch, cmd, ptyReq, &ptyFile, &cmdMutex)
 
 		case "exec":
+			if started {
+				req.Reply(false, nil)
+				continue
+			}
 			var ep execPayload
 			if err := ssh.Unmarshal(req.Payload, &ep); err == nil {
+				started = true
 				req.Reply(true, nil)
 				cmd := exec.Command(acct.Shell, "-c", ep.Command)
 				prepareCommand(cmd, acct, ptyReq, envVars)
-				runProcess(ch, cmd, ptyReq, &ptyFile, &cmdMutex)
-				return
+				go runProcess(ch, cmd, ptyReq, &ptyFile, &cmdMutex)
+			} else {
+				req.Reply(false, nil)
 			}
-			req.Reply(false, nil)
 
 		default:
 			req.Reply(false, nil)
@@ -308,7 +340,19 @@ func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, acct *accoun
 	}
 }
 
+// runProcess runs cmd, copying its I/O to and from ch, and closes ch once the
+// process exits.
+//
+// It now runs in its own goroutine (see handleSessionChannel), so it -- not
+// the caller -- owns ending the session: sending the SSH channel close is what
+// eventually closes the request channel back in handleSessionChannel and lets
+// that loop return. Previously handleSessionChannel called this synchronously
+// and returned right after, whose deferred ch.Close() served the same purpose;
+// that return is gone now that the request loop must keep running to service
+// window-change for the life of the session.
 func runProcess(ch ssh.Channel, cmd *exec.Cmd, ptyReq *ptyReqPayload, ptyFile **os.File, m *sync.Mutex) {
+	defer ch.Close()
+
 	if ptyReq != nil {
 		m.Lock()
 		f, err := pty.Start(cmd)
@@ -427,6 +471,28 @@ func buildEnv(acct *account, ptyReq *ptyReqPayload, extraEnv []string) []string 
 	} else {
 		env = append(env, "TERM=xterm-256color")
 	}
+
+	// Default to a UTF-8 locale. Without this, a session with no locale at all
+	// runs under the C/POSIX locale, and tmux in particular deliberately
+	// downgrades its output when it does not see UTF-8 in LC_ALL, LC_CTYPE, or
+	// LANG (in that priority order): wide and ambiguous-width glyphs
+	// (box-drawing characters, Nerd Font icons) are replaced with '_' rather
+	// than risk misrendering on a non-UTF-8 terminal (see tmux(1), the -u
+	// flag). C.UTF-8 is used rather than a named locale like en_US.UTF-8
+	// because glibc guarantees it exists everywhere without needing to be
+	// generated/enabled on the target host.
+	//
+	// Only LANG and LC_CTYPE are defaulted, not LC_ALL: LC_ALL overrides every
+	// other LC_* category unconditionally, so setting it here would clobber a
+	// client that supplied, say, LC_TIME without LC_ALL. LANG is purely a
+	// fallback for whatever is not otherwise set, and LC_CTYPE is the specific
+	// category governing character encoding/multibyte handling.
+	//
+	// These are only defaults: they are added first, and a client-supplied
+	// LANG or LC_* (forwarded by OpenSSH's SendEnv LANG LC_*, arriving as "env"
+	// requests) is appended afterwards, and the LAST value for a given name in
+	// Env wins. So a client with its own locale configured is never overridden.
+	env = append(env, "LANG=C.UTF-8", "LC_CTYPE=C.UTF-8")
 
 	// Client-supplied env vars are appended last but filtered: variables that
 	// influence the dynamic loader would let a client subvert the session.

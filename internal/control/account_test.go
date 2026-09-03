@@ -154,6 +154,64 @@ func TestBuildEnv_FiltersUnsafeClientVars(t *testing.T) {
 	}
 }
 
+// Without a client-supplied locale, sessions must default to a UTF-8 one.
+// Without this, tmux (and other locale-aware programs) deliberately downgrade
+// output to ASCII-safe rendering when they see a non-UTF-8 LANG/LC_CTYPE/
+// LC_ALL, replacing wide/ambiguous-width glyphs (box-drawing characters, Nerd
+// Font icons) with '_'.
+func TestBuildEnv_DefaultsToUTF8Locale(t *testing.T) {
+	acct := &account{Name: "alice", Home: "/home/alice", Shell: "/bin/sh", UID: 1000, GID: 1000}
+	env := buildEnv(acct, nil, nil)
+
+	joined := strings.Join(env, "\n")
+	if !strings.Contains(joined, "LANG=C.UTF-8") {
+		t.Errorf("no default UTF-8 LANG set:\n%s", joined)
+	}
+	if !strings.Contains(joined, "LC_CTYPE=C.UTF-8") {
+		t.Errorf("no default UTF-8 LC_CTYPE set:\n%s", joined)
+	}
+}
+
+// A client's own locale must win over the default, not be shadowed by it.
+// exec.Cmd resolves duplicate keys in Env by taking the LAST occurrence, so
+// the default must be added before, never after, client-supplied values.
+func TestBuildEnv_ClientLocaleOverridesDefault(t *testing.T) {
+	acct := &account{Name: "alice", Home: "/home/alice", Shell: "/bin/sh", UID: 1000, GID: 1000}
+	env := buildEnv(acct, nil, []string{"LANG=ja_JP.UTF-8", "LC_CTYPE=ja_JP.UTF-8"})
+
+	lastLANG, lastLCCTYPE := lastValue(env, "LANG"), lastValue(env, "LC_CTYPE")
+	if lastLANG != "ja_JP.UTF-8" {
+		t.Errorf("effective LANG = %q, want the client's ja_JP.UTF-8 (env: %v)", lastLANG, env)
+	}
+	if lastLCCTYPE != "ja_JP.UTF-8" {
+		t.Errorf("effective LC_CTYPE = %q, want the client's ja_JP.UTF-8 (env: %v)", lastLCCTYPE, env)
+	}
+}
+
+// LC_ALL must never be set by default: it overrides every other LC_* category
+// unconditionally, so defaulting it would clobber a client that set a specific
+// category (e.g. LC_TIME) without also setting LC_ALL.
+func TestBuildEnv_DoesNotDefaultLCAll(t *testing.T) {
+	acct := &account{Name: "alice", Home: "/home/alice", Shell: "/bin/sh", UID: 1000, GID: 1000}
+	env := buildEnv(acct, nil, nil)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LC_ALL=") {
+			t.Fatalf("LC_ALL must not be set by default, got %q", kv)
+		}
+	}
+}
+
+func lastValue(env []string, key string) string {
+	val := ""
+	prefix := key + "="
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			val = strings.TrimPrefix(kv, prefix)
+		}
+	}
+	return val
+}
+
 // The agent's own (root) environment must not leak into a session.
 func TestBuildEnv_DoesNotInheritAgentEnvironment(t *testing.T) {
 	const marker = "SSHHUB_AGENT_SECRET_MARKER"

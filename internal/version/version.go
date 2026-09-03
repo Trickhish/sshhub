@@ -8,4 +8,4 @@ package version
 //
 // It must therefore be a var, not a const: -X cannot patch a constant. The
 // fallback below is what locally built (unreleased) binaries report.
-var Version = "0.6.0"
+var Version = "0.6.1"
