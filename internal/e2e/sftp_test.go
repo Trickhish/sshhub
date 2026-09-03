@@ -45,8 +45,13 @@ func TestSFTP_UploadAndDownloadRoundTrip(t *testing.T) {
 	}
 	defer sftpClient.Close()
 
+	// Removed via defer (not t.Cleanup): t.Cleanup callbacks run AFTER the
+	// deferred sftpClient.Close() above has already torn down the session, so
+	// registering the removal there silently does nothing -- the file would be
+	// left behind on every run. The account itself is removed by the harness,
+	// but files it created under /tmp are not.
 	remotePath := remoteTestPath(t)
-	t.Cleanup(func() { _ = sftpClient.Remove(remotePath) })
+	defer func() { _ = sftpClient.Remove(remotePath) }()
 
 	const payload = "sshhub sftp round trip\n"
 
@@ -96,8 +101,11 @@ func TestSFTP_RunsAsEndUserNotRoot(t *testing.T) {
 
 	// A file created via SFTP must be owned by the resolved account, not root,
 	// which is what sftp-server would run as without the privilege drop.
+	//
+	// Removed via defer, not t.Cleanup: cleanups run after the deferred Close()
+	// above has already torn down the session, so Remove would silently fail.
 	remotePath := remoteTestPath(t)
-	t.Cleanup(func() { _ = sftpClient.Remove(remotePath) })
+	defer func() { _ = sftpClient.Remove(remotePath) }()
 
 	wf, err := sftpClient.Create(remotePath)
 	if err != nil {
