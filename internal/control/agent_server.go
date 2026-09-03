@@ -231,6 +231,42 @@ type execPayload struct {
 	Command string
 }
 
+// subsystemPayload is the RFC 4254 6.5 "subsystem" request: a single string
+// naming the subsystem (in practice, always "sftp" in the wild).
+type subsystemPayload struct {
+	Name string
+}
+
+// sftpServerPaths are the locations sftp-server is installed at across common
+// distributions. There is no standard path, so several are tried in order.
+var sftpServerPaths = []string{
+	"/usr/lib/openssh/sftp-server",     // Debian, Ubuntu
+	"/usr/libexec/openssh/sftp-server", // RHEL, Fedora, CentOS
+	"/usr/lib/ssh/sftp-server",         // openSUSE, some Arch setups
+	"/usr/libexec/sftp-server",         // Alpine, some BSD-influenced layouts
+	"/usr/lib/misc/sftp-server",        // Alpine (openssh-server-common)
+}
+
+// findSFTPServer locates the OpenSSH sftp-server binary, or "" if none of the
+// known paths exist.
+//
+// sshhub does not bundle its own SFTP implementation: sftp-server ships with
+// OpenSSH on essentially every Linux distribution and already implements the
+// protocol correctly, including all the edge cases (resume, symlinks,
+// permissions, statvfs) that a from-scratch or in-process reimplementation
+// would need to get right. Running the real binary as the resolved account
+// (see prepareCommand) also means the SAME privilege drop and
+// authorized_keys-derived identity that already governs shell/exec applies
+// here without any new code path capable of bypassing it.
+func findSFTPServer() string {
+	for _, p := range sftpServerPaths {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
 type envPayload struct {
 	Name  string
 	Value string
@@ -333,6 +369,36 @@ func handleSessionChannel(ch ssh.Channel, reqs <-chan *ssh.Request, acct *accoun
 			} else {
 				req.Reply(false, nil)
 			}
+
+		case "subsystem":
+			if started {
+				req.Reply(false, nil)
+				continue
+			}
+			var sp subsystemPayload
+			if err := ssh.Unmarshal(req.Payload, &sp); err != nil || sp.Name != "sftp" {
+				// Only sftp is supported. Other subsystems (netconf and the
+				// like) are not something sshd itself provides by default
+				// either, so refusing them is consistent with a stock sshd
+				// that has no matching Subsystem line configured.
+				req.Reply(false, nil)
+				continue
+			}
+			sftpServer := findSFTPServer()
+			if sftpServer == "" {
+				log.Printf("agent: sftp subsystem requested but no sftp-server binary found (checked: %s)",
+					strings.Join(sftpServerPaths, ", "))
+				req.Reply(false, nil)
+				continue
+			}
+			started = true
+			req.Reply(true, nil)
+			// sftp-server speaks its protocol directly over stdin/stdout with
+			// no pty and no shell involved, so ptyReq is not applicable here
+			// (runProcess's non-pty branch is always used for this command).
+			cmd := exec.Command(sftpServer)
+			prepareCommand(cmd, acct, nil, envVars)
+			go runProcess(ch, cmd, nil, &ptyFile, &cmdMutex)
 
 		default:
 			req.Reply(false, nil)
