@@ -82,9 +82,11 @@ type Listen struct {
 
 // Backend describes a single agent-backed backend server.
 type Backend struct {
-	ID    string `yaml:"id"`
-	Mode  string `yaml:"mode"`            // must be "reverse" (agent-backed)
-	Token string `yaml:"token,omitempty"` // per-backend registration token
+	// Aliases is a whitespace-separated list of client-visible names.
+	Aliases string `yaml:"aliases,omitempty"`
+	ID      string `yaml:"id"`
+	Mode    string `yaml:"mode"`            // must be "reverse" (agent-backed)
+	Token   string `yaml:"token,omitempty"` // per-backend registration token
 
 	// Username is no longer honoured. The Unix account a session runs as is
 	// determined solely by the matched route's end_user (defaulting to root).
@@ -260,6 +262,7 @@ func (c *Config) Validate() error {
 	}
 
 	seen := make(map[string]bool)
+	seenNames := make(map[string]string)
 	seenTokens := make(map[string]string)
 	for i := range c.Backends {
 		b := &c.Backends[i]
@@ -270,6 +273,23 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate backend id %q", b.ID)
 		}
 		seen[b.ID] = true
+		if strings.TrimSpace(b.Aliases) != "" {
+			for _, alias := range strings.Fields(b.Aliases) {
+				if strings.ContainsAny(alias, "@:/\\\t\n") || alias == "*" {
+					return fmt.Errorf("backend %q has invalid alias %q", b.ID, alias)
+				}
+				if owner, ok := seenNames[alias]; ok || alias == b.ID {
+					if !ok {
+						owner = b.ID
+					}
+					return fmt.Errorf("alias %q conflicts with backend %q", alias, owner)
+				}
+				if owner, ok := seenNames[alias]; ok {
+					return fmt.Errorf("alias %q is duplicated on backends %q and %q", alias, owner, b.ID)
+				}
+				seenNames[alias] = b.ID
+			}
+		}
 
 		if b.Token != "" {
 			if existingID, ok := seenTokens[b.Token]; ok {
@@ -297,6 +317,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	for alias, owner := range seenNames {
+		if seen[alias] {
+			return fmt.Errorf("alias %q on backend %q conflicts with a backend ID", alias, owner)
+		}
+	}
 	for i := range c.Routes {
 		r := &c.Routes[i]
 		// Normalize flat syntax into Match
@@ -396,6 +421,21 @@ func parseAutoUpdateWait(s string) (time.Duration, error) {
 }
 
 // BackendByID returns the backend with the given id, or nil.
+// BackendByName resolves exact IDs and aliases without DNS lookup.
+func (c *Config) BackendByName(name string) *Backend {
+	if b := c.BackendByID(name); b != nil {
+		return b
+	}
+	for i := range c.Backends {
+		for _, alias := range strings.Fields(c.Backends[i].Aliases) {
+			if alias == name {
+				return &c.Backends[i]
+			}
+		}
+	}
+	return nil
+}
+
 func (c *Config) BackendByID(id string) *Backend {
 	for i := range c.Backends {
 		if c.Backends[i].ID == id {

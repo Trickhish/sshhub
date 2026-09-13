@@ -186,24 +186,30 @@ func (s *Server) forward(client *ssh.ServerConn, ch ssh.NewChannel) {
 		ch.Reject(ssh.Prohibited, "only configured backend names on logical port 22 are allowed")
 		return
 	}
-	// Exact backend names only. No DNS resolution, route fallbacks, user-selected
-	// network addresses, or hub-selected Unix accounts.
+	// Resolve aliases before authorizing against canonical backend IDs.
 	allowed := false
-	for _, u := range s.cfg.JumpUsers {
-		if u.Name != client.User() {
-			continue
-		}
-		for _, id := range u.Backends {
-			if id == p.DestAddr {
-				allowed = true
-			}
-		}
-	}
-	if !allowed || s.cfg.BackendByID(p.DestAddr) == nil {
+	backendConfig := s.cfg.BackendByName(p.DestAddr)
+	if backendConfig == nil {
 		ch.Reject(ssh.Prohibited, "destination denied")
 		return
 	}
-	backend, err := s.registry.Open(context.Background(), p.DestAddr)
+	backendID := backendConfig.ID
+	if !allowed {
+		for _, u := range s.cfg.JumpUsers {
+			if u.Name == client.User() {
+				for _, id := range u.Backends {
+					if id == backendID {
+						allowed = true
+					}
+				}
+			}
+		}
+	}
+	if !allowed {
+		ch.Reject(ssh.Prohibited, "destination denied")
+		return
+	}
+	backend, err := s.registry.Open(context.Background(), backendID)
 	if err != nil {
 		ch.Reject(ssh.ConnectionFailed, "backend unavailable")
 		return
@@ -215,7 +221,7 @@ func (s *Server) forward(client *ssh.ServerConn, ch ssh.NewChannel) {
 	}
 	defer c.Close()
 	go ssh.DiscardRequests(reqs)
-	log.Printf("jump user %q -> backend %q", client.User(), p.DestAddr)
+	log.Printf("jump user %q -> backend %q (requested %q)", client.User(), backendID, p.DestAddr)
 	bridge(c, backend)
 }
 
