@@ -102,10 +102,22 @@ chmod 644 /etc/systemd/system/sshhub-agent.service
 install -m 755 "$TMP/sshhub-agent-update" /usr/local/bin/.sshhub-agent-update.new
 mv /usr/local/bin/.sshhub-agent-update.new /usr/local/bin/sshhub-agent-update
 install -d -m 755 /usr/local/lib/sshhub
-install -m 755 "${BASH_SOURCE[0]:-$VERIFIER}" /usr/local/lib/sshhub/install-agent.sh 2>/dev/null || \
-  curl --proto '=https' -fsSL --max-time 60 -o /usr/local/lib/sshhub/install-agent.sh \
+# Persist THIS installer for the updater to re-run later. When piped from curl
+# BASH_SOURCE is not a readable file, so fetch a fresh copy instead. Never fall
+# back to $VERIFIER: that is the Python verifier, not the installer, and copying
+# it here silently breaks every future automatic update.
+INSTALLER_DST=/usr/local/lib/sshhub/install-agent.sh
+if [[ -n "${BASH_SOURCE[0]:-}" && -r "${BASH_SOURCE[0]}" ]] && head -1 "${BASH_SOURCE[0]}" | grep -q bash; then
+  install -m 755 "${BASH_SOURCE[0]}" "$INSTALLER_DST"
+else
+  curl --proto '=https' --proto-redir '=https' -fsSL --max-time 60 -o "$INSTALLER_DST.new" \
     https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh
-chmod 755 /usr/local/lib/sshhub/install-agent.sh
+  head -1 "$INSTALLER_DST.new" | grep -q bash || { printf 'Refusing to install a non-bash installer\n' >&2; rm -f "$INSTALLER_DST.new"; exit 1; }
+  mv "$INSTALLER_DST.new" "$INSTALLER_DST"
+fi
+chmod 755 "$INSTALLER_DST"
+# Fail fast rather than leaving a broken updater to be discovered weeks later.
+head -1 "$INSTALLER_DST" | grep -q bash || { printf 'Installer self-copy is corrupt\n' >&2; exit 1; }
 install -m 755 "$VERIFIER" /usr/local/lib/sshhub/verify-release.py
 
 if [[ "$SOAK" == off ]]; then
