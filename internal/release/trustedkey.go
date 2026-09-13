@@ -12,14 +12,14 @@ import (
 //
 // It is empty in locally built binaries, which is why VerificationAvailable
 // exists: a developer build should not silently behave as if it verifies.
-var TrustedPublicKey = ""
+var TrustedPublicKey = "LY7nOn0uWCqGfv6sBy3io9y0SLlW/NVqGg9TB8MWPPE="
 
 // RequireSignature controls behaviour when no trusted key is compiled in.
 //
 // Injected as "true" for official release builds. When set, an update with no
 // verifiable signature is refused rather than installed. Locally built binaries
 // leave it unset so a developer can still update from a private build.
-var RequireSignature = ""
+var RequireSignature = "true"
 
 // TrustedKey returns the compiled-in release signing key.
 func TrustedKey() (ed25519.PublicKey, bool) {
@@ -28,6 +28,7 @@ func TrustedKey() (ed25519.PublicKey, bool) {
 		if k, err := ParsePublicKey(env); err == nil {
 			return k, true
 		}
+		return nil, false
 	}
 	if TrustedPublicKey == "" {
 		return nil, false

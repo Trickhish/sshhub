@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,18 +19,32 @@ import (
 
 func main() {
 	hub := flag.String("hub", "", "hub control address (host:port)")
-	token := flag.String("token", "", "control plane token")
+	tokenFile := flag.String("token-file", "", "owner-only file containing the registration token")
 	backend := flag.String("backend", "", "optional backend id override")
-	sshd := flag.String("sshd", "", "optional local sshd address to bridge to (if omitted, agent serves sessions natively)")
-	hostKeyPath := flag.String("host-key", control.DefaultHostKeyPath,
-		"path to the agent's persistent SSH host key")
+	sshd := flag.String("sshd", "127.0.0.1:22", "fixed loopback OpenSSH address")
 	pin := flag.String("hub-pin", "", "hub public key pin (sha256:...) shown by 'sshhub-ctl add'")
 	insecure := flag.Bool("insecure-no-pin", false,
 		"connect without verifying the hub's identity (TESTING ONLY: exposes the token to interception)")
 	flag.Parse()
 
-	if *hub == "" || *token == "" {
-		log.Fatal("--hub and --token are required")
+	if *hub == "" || *tokenFile == "" {
+		log.Fatal("--hub and --token-file are required")
+	}
+	st, err := os.Lstat(*tokenFile)
+	if err != nil || !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 {
+		log.Fatal("token file must be a regular owner-only file")
+	}
+	data, err := os.ReadFile(*tokenFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		log.Fatal("empty token")
+	}
+	host, _, err := net.SplitHostPort(*sshd)
+	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+		log.Fatal("--sshd must use a literal loopback IP")
 	}
 
 	// The connection carries the registration token, which is this agent's only
@@ -65,10 +80,6 @@ func main() {
 
 	// Create the agent server first so its persistent host key can be advertised
 	// at registration for the hub to pin.
-	agentServer, err := control.NewAgentServerWithHostKey(*hostKeyPath)
-	if err != nil {
-		log.Fatalf("agent host key: %v", err)
-	}
 
 	// Independent update check, in addition to the hub telling us at
 	// registration. The registration path only fires when the HUB restarts, so
@@ -83,7 +94,7 @@ func main() {
 		cancel()
 	}()
 
-	run(ctx, cancel, agentServer, tlsConfig, *hub, *backend, *token, *sshd)
+	run(ctx, tlsConfig, *hub, *backend, token, *sshd)
 }
 
 // run keeps the agent connected to the hub, reconnecting with backoff.
@@ -94,7 +105,7 @@ func main() {
 // process crashes, and it means the agent only survives where the supervisor is
 // configured correctly. A hub that is down for maintenance should not require
 // the supervisor to paper over it.
-func run(ctx context.Context, cancel context.CancelFunc, agentServer *control.AgentServer,
+func run(ctx context.Context,
 	tlsConfig *tls.Config, hub, backend, token, sshd string) {
 
 	const (
@@ -110,7 +121,7 @@ func run(ctx context.Context, cancel context.CancelFunc, agentServer *control.Ag
 		}
 
 		session, assigned, err := control.ConnectWithHostKey(
-			ctx, hub, backend, token, agentServer.HostKey(), tlsConfig)
+			ctx, hub, backend, token, "", tlsConfig)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -136,11 +147,7 @@ func run(ctx context.Context, cancel context.CancelFunc, agentServer *control.Ag
 		loggedDown = false
 
 		// Serve until the tunnel drops, then reconnect.
-		if sshd != "" {
-			err = control.Serve(ctx, session, sshd)
-		} else {
-			err = agentServer.ServeStreams(ctx, session)
-		}
+		err = control.Serve(ctx, session, sshd)
 		session.Close()
 
 		if ctx.Err() != nil {

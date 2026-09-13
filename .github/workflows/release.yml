@@ -1,157 +1,85 @@
 name: Release
-
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to release, e.g. v0.5.0"
-        required: true
-        type: string
-      urgent_reason:
-        description: >-
-          Mark this release URGENT so hubs install it immediately, bypassing
-          their configured auto_update_wait. Only for fixes that must not wait
-          (e.g. an authentication bypass). Leave empty for a normal release.
-        required: false
-        type: string
-
 permissions:
-  contents: write
-
+  contents: read
 jobs:
   build:
-    name: Build & Release Assets
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
-
-      - name: Resolve release version
-        id: ver
-        run: |
-          # On workflow_dispatch GITHUB_REF_NAME is the BRANCH, not a tag, so
-          # the tag input is authoritative when present.
-          REF="${{ inputs.tag || github.ref_name }}"
-          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
-          echo "Releasing version ${REF#v}"
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+          persist-credentials: false
+      - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
-
-      - name: Build Binaries (${{ matrix.goos }}-${{ matrix.goarch }})
+          go-version-file: go.mod
+      - name: Validate version
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
-          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+          REF: ${{ github.ref_name }}
         run: |
-          # Inject the tag as the version. Without this the binaries report the
-          # hardcoded fallback, the hub compares equal versions, and no agent is
-          # ever told to update -- a silent no-op release.
-          VERSION="${{ steps.ver.outputs.version }}"
-          echo "Building version ${VERSION}"
-          LDFLAGS="-s -w -X github.com/Trickhish/sshhub/internal/version.Version=${VERSION}"
-          # Compile in the release signing key so binaries verify future
-          # updates. RequireSignature makes an unverifiable update a hard
-          # failure rather than a warning.
-          if [ -n "${RELEASE_PUBLIC_KEY}" ]; then
-            LDFLAGS="$LDFLAGS -X github.com/Trickhish/sshhub/internal/release.TrustedPublicKey=${RELEASE_PUBLIC_KEY}"
-            LDFLAGS="$LDFLAGS -X github.com/Trickhish/sshhub/internal/release.RequireSignature=true"
-          else
-            echo "::warning::RELEASE_PUBLIC_KEY is not set; binaries will not verify update signatures"
-          fi
-          go build -ldflags="$LDFLAGS" -o dist/sshhub ./cmd/sshhub
-          go build -ldflags="$LDFLAGS" -o dist/sshhub-agent ./cmd/sshhub-agent
-          go build -ldflags="$LDFLAGS" -o dist/sshhub-ctl ./cmd/sshhub-ctl
-
-      - name: Verify version was injected
+          [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "VERSION=${REF#v}" >> "$GITHUB_ENV"
+      - name: Test
         run: |
-          VERSION="${{ steps.ver.outputs.version }}"
-          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "amd64" ]; then
-            got="$(./dist/sshhub-ctl version | awk '{print $NF}')"
-            if [ "$got" != "$VERSION" ]; then
-              echo "version injection failed: binary reports '$got', tag is '$VERSION'" >&2
-              exit 1
-            fi
-            echo "verified: binary reports $got"
-          fi
-
-      - name: Package Release Archives
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+          sudo env PATH="$PATH" go test ./... -race -count=1 -timeout 300s
+          go vet ./...
+      - name: Build candidates
         run: |
           mkdir -p release
-          tar -czvf release/sshhub-agent-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C dist sshhub-agent
-          tar -czvf release/sshhub-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C dist sshhub sshhub-ctl
-          tar -czvf release/sshhub-all-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C dist sshhub sshhub-agent sshhub-ctl
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+          for ARCH in amd64 arm64; do
+            mkdir -p "dist/$ARCH"
+            for BIN in sshhub sshhub-agent sshhub-ctl; do
+              CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath -ldflags="-s -w -X github.com/Trickhish/sshhub/internal/version.Version=$VERSION" -o "dist/$ARCH/$BIN" "./cmd/$BIN"
+            done
+            tar -czf "release/sshhub-linux-$ARCH.tar.gz" -C "dist/$ARCH" sshhub sshhub-ctl
+            tar -czf "release/sshhub-agent-linux-$ARCH.tar.gz" -C "dist/$ARCH" sshhub-agent
+          done
+      - uses: actions/upload-artifact@v4
         with:
-          name: assets-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: unsigned-release-candidates
           path: release/*
-
-  release:
-    name: Publish GitHub Release
+  publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
-
-      - name: Download All Build Artifacts
-        uses: actions/download-artifact@v4
+          persist-credentials: false
+      - uses: actions/setup-go@v5
         with:
-          path: dist-release
-          merge-multiple: true
-
-      # Signs the manifest covering every artifact. Hubs and agents verify this
-      # before installing an update, so publishing a release is not by itself
-      # enough to ship code -- the signing key is required too.
-      - name: Set up Go
-        uses: actions/setup-go@v5
+          go-version-file: go.mod
+      - uses: actions/download-artifact@v4
         with:
-          go-version: "1.23"
-
-      - name: Sign Release Manifest
+          name: unsigned-release-candidates
+          path: release
+      - name: Build signing tool before exposing the signing secret
+        run: go build -o /tmp/sshhub-sign ./cmd/sshhub-sign
+      - name: Sign release
         env:
           SSHHUB_SIGNING_KEY: ${{ secrets.SSHHUB_SIGNING_KEY }}
-          URGENT_REASON: ${{ github.event.inputs.urgent_reason }}
+          REF: ${{ github.ref_name }}
         run: |
-          if [ -z "${SSHHUB_SIGNING_KEY}" ]; then
-            echo "::error::SSHHUB_SIGNING_KEY is not set; refusing to publish an unsigned release."
-            echo "Clients built with RequireSignature will refuse to install it."
-            exit 1
-          fi
-          REF="${{ inputs.tag || github.ref_name }}"
-          VERSION="${REF#v}"
-          go build -o /tmp/sshhub-sign ./cmd/sshhub-sign
-          if [ -n "${URGENT_REASON}" ]; then
-            /tmp/sshhub-sign manifest --version "${VERSION}" --dir dist-release --urgent "${URGENT_REASON}"
-          else
-            /tmp/sshhub-sign manifest --version "${VERSION}" --dir dist-release
-          fi
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          files: dist-release/*
-          generate_release_notes: true
+          test -n "$SSHHUB_SIGNING_KEY"
+          /tmp/sshhub-sign manifest --version "${REF#v}" --dir release
+      - name: Verify signed artifacts against installer trust root
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SSHHUB_EXPECTED_VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir verified
+          for ARCH in amd64 arm64; do
+            python3 scripts/verify-release.py release "sshhub-linux-$ARCH.tar.gz" verified sshhub sshhub-ctl
+            python3 scripts/verify-release.py release "sshhub-agent-linux-$ARCH.tar.gz" verified sshhub-agent
+          done
+      - name: Publish breaking release without changing latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref_name }}
+        run: |
+          gh release create "$REF" release/* --verify-tag --latest=false --title "$REF: forwarding-only SSH" --notes "Breaking migration: OpenSSH backends and explicit jump_users grants are required. Direct SSH sessions and agent self-updates have been removed. Upgrade hub and agents together using independent administrative access. See the README migration instructions."

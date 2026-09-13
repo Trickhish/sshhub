@@ -128,6 +128,9 @@ func (r *Registry) unregister(backend string, s *yamux.Session) {
 
 // Open opens a new stream to the given backend.
 func (r *Registry) Open(ctx context.Context, backend string) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	r.mu.RLock()
 	var s *yamux.Session
 	if c := r.conns[backend]; c != nil {

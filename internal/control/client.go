@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"runtime"
+	"time"
 
 	"github.com/Trickhish/sshhub/internal/version"
 	"github.com/hashicorp/yamux"
@@ -40,6 +41,9 @@ func ConnectWithHostKey(ctx context.Context, hubAddr, backend, token, hostKey st
 	if err != nil {
 		return nil, "", fmt.Errorf("dial hub: %w", err)
 	}
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 
 	session, err := yamux.Client(conn, yamux.DefaultConfig())
 	if err != nil {
@@ -52,6 +56,7 @@ func ConnectWithHostKey(ctx context.Context, hubAddr, backend, token, hostKey st
 		session.Close()
 		return nil, "", err
 	}
+	conn.SetDeadline(time.Time{})
 	return session, assignedBackend, nil
 }
 
@@ -84,14 +89,8 @@ func register(session *yamux.Session, backend, token, hostKey string) (string, e
 		return "", &RegistrationError{Message: resp.Error}
 	}
 
-	if resp.UpdateAvailable {
-		log.Printf("agent: Hub is running version %s (local agent is %s). Downloading update from GitHub...", resp.LatestVersion, version.Version)
-		go func() {
-			if err := DownloadAndApplyGitHubUpdate(resp.LatestVersion); err != nil {
-				log.Printf("agent: github update: %v", err)
-			}
-		}()
-	}
+	// A hub response never triggers executable replacement. Updates are checked
+	// independently against signed releases, not hub-selected versions.
 
 	assigned := resp.Backend
 	if assigned == "" {
@@ -102,6 +101,13 @@ func register(session *yamux.Session, backend, token, hostKey string) (string, e
 
 // Serve bridges incoming streams to the local sshd until the session closes.
 func Serve(ctx context.Context, session *yamux.Session, sshdAddr string) error {
+	host, _, err := net.SplitHostPort(sshdAddr)
+	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+		return fmt.Errorf("sshd must be a fixed literal loopback address")
+	}
+	stop := context.AfterFunc(ctx, func() { session.Close() })
+	defer stop()
+	slots := make(chan struct{}, 64)
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
@@ -112,7 +118,12 @@ func Serve(ctx context.Context, session *yamux.Session, sshdAddr string) error {
 				return fmt.Errorf("accept stream: %w", err)
 			}
 		}
-		go bridge(stream, sshdAddr)
+		select {
+		case slots <- struct{}{}:
+			go func() { defer func() { <-slots }(); bridge(stream, sshdAddr) }()
+		default:
+			stream.Close()
+		}
 	}
 }
 
@@ -121,7 +132,7 @@ func Serve(ctx context.Context, session *yamux.Session, sshdAddr string) error {
 func bridge(stream net.Conn, sshdAddr string) {
 	defer stream.Close()
 
-	sshd, err := net.Dial("tcp", sshdAddr)
+	sshd, err := net.DialTimeout("tcp", sshdAddr, 5*time.Second)
 	if err != nil {
 		log.Printf("bridge: dial sshd: %v", err)
 		return

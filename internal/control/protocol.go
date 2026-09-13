@@ -14,11 +14,12 @@ import (
 
 // RegisterRequest is sent by an agent over its registration stream.
 type RegisterRequest struct {
-	Backend string `json:"backend,omitempty"`
-	Token   string `json:"token"`
-	Version string `json:"version,omitempty"`
-	OS      string `json:"os,omitempty"`
-	Arch    string `json:"arch,omitempty"`
+	Transport string `json:"transport"`
+	Backend   string `json:"backend,omitempty"`
+	Token     string `json:"token"`
+	Version   string `json:"version,omitempty"`
+	OS        string `json:"os,omitempty"`
+	Arch      string `json:"arch,omitempty"`
 	// HostKey is the agent's SSH host public key in authorized_keys form. The
 	// hub pins it so a later session cannot be served by a different endpoint.
 	HostKey string `json:"host_key,omitempty"`
@@ -43,6 +44,7 @@ type UpdateHeader struct {
 
 // WriteRegister encodes a RegisterRequest onto the stream.
 func WriteRegister(w io.Writer, req RegisterRequest) error {
+	req.Transport = "openssh-forward-v1"
 	enc := json.NewEncoder(w)
 	return enc.Encode(req)
 }
@@ -50,7 +52,7 @@ func WriteRegister(w io.Writer, req RegisterRequest) error {
 // ReadRegister decodes a RegisterRequest from the stream.
 func ReadRegister(r io.Reader) (RegisterRequest, error) {
 	var req RegisterRequest
-	if err := json.NewDecoder(r).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r, 65536)).Decode(&req); err != nil {
 		return req, err
 	}
 	return req, nil
@@ -64,7 +66,7 @@ func WriteResponse(w io.Writer, resp RegisterResponse) error {
 // ReadResponse decodes a RegisterResponse from the stream.
 func ReadResponse(r io.Reader) (RegisterResponse, error) {
 	var resp RegisterResponse
-	if err := json.NewDecoder(r).Decode(&resp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r, 65536)).Decode(&resp); err != nil {
 		return resp, err
 	}
 	return resp, nil

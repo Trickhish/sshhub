@@ -21,7 +21,7 @@ import (
 func TestPTY_WindowChangeAfterShellStartResizesPTY(t *testing.T) {
 	h := newHarness(t)
 
-	client, err := h.dial(t, h.Backend, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
+	client, err := h.dialInner(t, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestPTY_DefaultsToUTF8Locale(t *testing.T) {
 func TestPTY_ExitStatusPropagates(t *testing.T) {
 	h := newHarness(t)
 
-	client, err := h.dial(t, h.Backend, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
+	client, err := h.dialInner(t, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

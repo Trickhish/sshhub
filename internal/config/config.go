@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"golang.org/x/crypto/ssh"
 	"os"
 	"strings"
 	"time"
@@ -63,6 +64,14 @@ type Config struct {
 	ControlTokens  []string             `yaml:"control_tokens,omitempty"`
 	Backends       []Backend            `yaml:"backends"`
 	Routes         []Route              `yaml:"routes"`
+	JumpUsers      []JumpUser           `yaml:"jump_users"`
+}
+
+// JumpUser grants transport access, not a backend Unix identity.
+type JumpUser struct {
+	Name     string   `yaml:"name"`
+	Keys     []string `yaml:"keys"`
+	Backends []string `yaml:"backends"`
 }
 
 // Listen holds the addresses the hub binds to.
@@ -207,6 +216,27 @@ func Load(path string) (*Config, error) {
 
 // Validate checks the configuration for structural errors and normalizes route syntax.
 func (c *Config) Validate() error {
+	if len(c.ControlTokens) != 0 {
+		return fmt.Errorf("global control_tokens removed; use per-backend tokens")
+	}
+	seenUsers := map[string]bool{}
+	for _, u := range c.JumpUsers {
+		if u.Name == "" || seenUsers[u.Name] || len(u.Keys) == 0 || len(u.Backends) == 0 {
+			return fmt.Errorf("jump user needs a unique name, keys and backends")
+		}
+		seenUsers[u.Name] = true
+		for _, text := range u.Keys {
+			_, _, options, rest, err := ssh.ParseAuthorizedKey([]byte(text))
+			if err != nil || len(options) != 0 || strings.TrimSpace(string(rest)) != "" {
+				return fmt.Errorf("jump user %q: keys must be individual public keys without options", u.Name)
+			}
+		}
+		for _, id := range u.Backends {
+			if c.BackendByID(id) == nil {
+				return fmt.Errorf("jump user %q: unknown backend %q", u.Name, id)
+			}
+		}
+	}
 	if c.Listen.SSH == "" {
 		return fmt.Errorf("listen.ssh is required")
 	}
@@ -215,9 +245,6 @@ func (c *Config) Validate() error {
 	}
 	if c.HostKey == "" {
 		return fmt.Errorf("host_key is required")
-	}
-	if len(c.Backends) == 0 {
-		return fmt.Errorf("at least one backend is required")
 	}
 
 	// Reject rather than silently defaulting: a typo here would quietly restore
@@ -267,9 +294,6 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if len(c.Routes) == 0 {
-		return fmt.Errorf("at least one route is required")
-	}
 	for i := range c.Routes {
 		r := &c.Routes[i]
 		// Normalize flat syntax into Match
@@ -298,6 +322,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("route %d: invalid end_user %q", i, r.EndUser)
 			}
 		}
+	}
+	if len(c.Backends) == 0 {
+		return nil
 	}
 	return nil
 }

@@ -14,9 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Trickhish/sshhub/internal/release"
@@ -200,6 +202,12 @@ func compareVersions(a, b string) int {
 // DownloadAndApplyHubUpdate downloads the latest sshhub and sshhub-ctl release binaries
 // from GitHub over verified HTTPS, replaces them in /usr/local/bin, and restarts the service.
 func DownloadAndApplyHubUpdate(targetVersion string) error {
+	if !regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(targetVersion) {
+		return fmt.Errorf("invalid release version")
+	}
+	if !IsNewer(targetVersion, version.Version) {
+		return fmt.Errorf("update must be strictly newer than running version")
+	}
 	arch := runtime.GOARCH
 	goos := runtime.GOOS
 	assetName := fmt.Sprintf("sshhub-%s-%s.tar.gz", goos, arch)
@@ -215,6 +223,15 @@ func DownloadAndApplyHubUpdate(targetVersion string) error {
 	}
 
 	client := newHTTPClient(3 * time.Minute)
+	lock, err := os.OpenFile(filepath.Join(installDir, ".sshhub-update.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fmt.Errorf("update already running: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
 	var downloadURL string
 	if tag != "" {
@@ -270,7 +287,7 @@ func DownloadAndApplyHubUpdate(targetVersion string) error {
 	defer gzReader.Close()
 
 	tarReader := tar.NewReader(gzReader)
-	tmpDir, err := os.MkdirTemp("", "sshhub-hub-update-*")
+	tmpDir, err := os.MkdirTemp(installDir, ".sshhub-hub-update-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
@@ -288,8 +305,11 @@ func DownloadAndApplyHubUpdate(targetVersion string) error {
 
 		baseName := filepath.Base(header.Name)
 		if header.Typeflag == tar.TypeReg && (baseName == "sshhub" || baseName == "sshhub-ctl") {
+			if header.Name != baseName || header.Size <= 0 || header.Size > maxArtifactBytes {
+				return fmt.Errorf("invalid binary archive entry")
+			}
 			tmpDst := filepath.Join(tmpDir, baseName)
-			f, err := os.OpenFile(tmpDst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+			f, err := os.OpenFile(tmpDst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o755)
 			if err != nil {
 				return fmt.Errorf("create temp binary %s: %w", tmpDst, err)
 			}
@@ -302,8 +322,8 @@ func DownloadAndApplyHubUpdate(targetVersion string) error {
 		}
 	}
 
-	if binariesFound == 0 {
-		return fmt.Errorf("no binaries found in release archive")
+	if binariesFound != 2 {
+		return fmt.Errorf("release archive must contain both binaries")
 	}
 
 	// Atomically replace installed binaries
@@ -323,24 +343,7 @@ func DownloadAndApplyHubUpdate(targetVersion string) error {
 
 func replaceBinary(src, dst string) error {
 	_ = os.Chmod(src, 0o755)
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-	// Fallback copy
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	return err
+	return os.Rename(src, dst)
 }
 
 // StartAutoUpdater runs a periodic background loop checking for GitHub releases.
@@ -521,12 +524,7 @@ const manifestAssetName = "sshhub-manifest.json"
 func fetchVerifiedManifest(client *http.Client, tag string) (*release.Manifest, error) {
 	trusted, haveKey := release.TrustedKey()
 	if !haveKey {
-		if release.SignatureRequired() {
-			return nil, fmt.Errorf("refusing update: this build requires signed releases " +
-				"but has no trusted release key compiled in")
-		}
-		log.Printf("hub: WARNING: no release signing key compiled in; update will NOT be verified")
-		return nil, nil
+		return nil, fmt.Errorf("refusing update: no valid trusted release key")
 	}
 
 	var url string
@@ -561,6 +559,9 @@ func fetchVerifiedManifest(client *http.Client, tag string) (*release.Manifest, 
 	m, err := release.Verify(data, trusted)
 	if err != nil {
 		return nil, fmt.Errorf("refusing update: %w", err)
+	}
+	if tag == "" || strings.TrimPrefix(tag, "v") != m.Version {
+		return nil, fmt.Errorf("signed manifest version does not match requested release")
 	}
 	return m, nil
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -23,6 +24,9 @@ func GenerateToken() (string, error) {
 // If token is empty, a secure random token is generated.
 // If endUser is empty, sessions run as DefaultEndUser (root).
 func AddBackend(configPath, id, token, endUser string) (string, error) {
+	if endUser != "" {
+		return "", fmt.Errorf("--end-user removed: OpenSSH authenticates the inner client's chosen account")
+	}
 	if id == "" {
 		return "", fmt.Errorf("backend id cannot be empty")
 	}
@@ -41,7 +45,7 @@ func AddBackend(configPath, id, token, endUser string) (string, error) {
 	}
 
 	if b := cfg.BackendByID(id); b != nil {
-		return "", fmt.Errorf("backend %q already exists (token: %s)", id, b.Token)
+		return "", fmt.Errorf("backend %q already exists", id)
 	}
 
 	if token == "" {
@@ -57,34 +61,7 @@ func AddBackend(configPath, id, token, endUser string) (string, error) {
 		Token: token,
 	})
 
-	// Check if a route already covers this backend
-	hasRoute := false
-	for _, r := range cfg.Routes {
-		if r.Match.Hostname == id || r.Hostname == id {
-			hasRoute = true
-			break
-		}
-	}
-
-	if !hasRoute {
-		newRoute := Route{
-			Hostname: id,
-			Backend:  id,
-			EndUser:  endUser,
-		}
-		// Insert before any catch-all username: "*" route
-		inserted := false
-		for i, r := range cfg.Routes {
-			if r.Match.Username == "*" || r.Username == "*" {
-				cfg.Routes = append(cfg.Routes[:i], append([]Route{newRoute}, cfg.Routes[i:]...)...)
-				inserted = true
-				break
-			}
-		}
-		if !inserted {
-			cfg.Routes = append(cfg.Routes, newRoute)
-		}
-	}
+	// Transport grants require explicit jump_users configuration.
 
 	if err := Save(configPath, &cfg); err != nil {
 		return "", err
@@ -118,16 +95,15 @@ func RemoveBackend(configPath, id string) error {
 		return fmt.Errorf("backend %q not found", id)
 	}
 	cfg.Backends = newBackends
-
-	// Remove routes targeting this backend
-	newRoutes := make([]Route, 0, len(cfg.Routes))
-	for _, r := range cfg.Routes {
-		if r.Backend == id {
-			continue
+	for i := range cfg.JumpUsers {
+		var kept []string
+		for _, b := range cfg.JumpUsers[i].Backends {
+			if b != id {
+				kept = append(kept, b)
+			}
 		}
-		newRoutes = append(newRoutes, r)
+		cfg.JumpUsers[i].Backends = kept
 	}
-	cfg.Routes = newRoutes
 
 	return Save(configPath, &cfg)
 }
@@ -138,7 +114,23 @@ func Save(path string, cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	if err := os.WriteFile(path, out, 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".sshhub-config-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(out); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
 		return fmt.Errorf("write config %s: %w", path, err)
 	}
 	return nil

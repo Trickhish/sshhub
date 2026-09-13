@@ -1,268 +1,84 @@
 #!/usr/bin/env bash
-# install-agent.sh: 1-line installer and updater for SSHub Agent (Client/Node)
+# Install a locally downloaded, signature-verified release. No curl|tar fallback.
 set -euo pipefail
-
-REPO="Trickhish/sshhub"
-INSTALL_DIR="/usr/local/bin"
-SERVICE_FILE="/etc/systemd/system/sshhub-agent.service"
-
-HUB=""
-TOKEN=""
-HUB_PIN=""
-INSECURE_NO_PIN=""
-SSHD=""
-REBUILD=false
-VERSION="latest"
-
-usage() {
-  echo "Usage:"
-  echo "  Fresh install: $0 --hub <hub-host:7000> --token <token> [options]"
-  echo "  Update:        $0 [options]"
-  echo ""
-  echo "Options:"
-  echo "  --hub <host:port>     SSHub Hub control listener address (e.g. hub.example.com:7000)"
-  echo "  --token <token>       Authentication token generated on the Hub"
-  echo "  --sshd <host:port>    Target OpenSSH daemon address (default: embedded native agent)"
-  echo "  --build, --rebuild    Force compilation from source instead of downloading release"
-  echo "  --version <vX.Y.Z>    Target release version (default: latest stable release)"
-  echo ""
-  echo "Example:"
-  echo "  curl -sSL https://raw.githubusercontent.com/${REPO}/main/scripts/install-agent.sh | sudo bash -s -- --hub hub.example.com:7000 --token \"<token>\""
-  exit 1
-}
-
-# Helper to extract flag values from existing service file
-extract_flag() {
-  local flag="$1"
-  local file="$2"
-  if [[ ! -f "$file" ]]; then
-    return
-  fi
-  sed -n "s/.*--${flag}[ =][\"'[:space:]]*\([^\"'[:space:]]*\).*/\1/p" "$file" | head -n 1
-}
-
-# Parse flags or positional arguments
-while [[ $# -gt 0 ]]; do
+umask 077
+HUB=""; PIN=""; TOKEN_FILE=""; RELEASE_DIR=""; VERSION="latest"; TOKEN=""; SSHD="127.0.0.1:22"
+while (($#)); do
   case "$1" in
-    --hub)
-      HUB="$2"
-      shift 2
-      ;;
-    --token)
-      TOKEN="$2"
-      shift 2
-      ;;
-    --hub-pin)
-      HUB_PIN="$2"
-      shift 2
-      ;;
-    --insecure-no-pin)
-      INSECURE_NO_PIN="1"
-      shift
-      ;;
-    --sshd)
-      SSHD="$2"
-      shift 2
-      ;;
-    --version)
-      VERSION="$2"
-      shift 2
-      ;;
-    --build|--rebuild|--from-source)
-      REBUILD=true
-      shift
-      ;;
-    -h|--help)
-      usage
-      ;;
-    *)
-      if [[ -z "$HUB" ]]; then
-        HUB="$1"
-      elif [[ -z "$TOKEN" ]]; then
-        TOKEN="$1"
-      else
-        echo "Unknown argument: $1" >&2
-        usage
-      fi
-      shift
-      ;;
+    --hub) HUB="$2"; shift 2;;
+    --hub-pin) PIN="$2"; shift 2;;
+    --token-file) TOKEN_FILE="$2"; shift 2;;
+    --release-dir) RELEASE_DIR="$2"; shift 2;;
+    --version) VERSION="$2"; shift 2;;
+    --token) TOKEN="$2"; shift 2;;
+    --sshd) SSHD="$2"; shift 2;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; exit 1;;
   esac
 done
-
-# If flags not provided, check for existing installation configuration
-if [[ -f "$SERVICE_FILE" ]]; then
-  if [[ -z "$HUB" ]]; then
-    HUB="$(extract_flag "hub" "$SERVICE_FILE")"
-  fi
-  if [[ -z "$TOKEN" ]]; then
-    TOKEN="$(extract_flag "token" "$SERVICE_FILE")"
-  fi
-  if [[ -z "$HUB_PIN" ]]; then
-    HUB_PIN="$(extract_flag "hub-pin" "$SERVICE_FILE")"
-  fi
-  if [[ -z "$SSHD" ]]; then
-    SSHD="$(extract_flag "sshd" "$SERVICE_FILE")"
-  fi
-  if [[ -n "$HUB" && -n "$TOKEN" ]]; then
-    echo "--> Detected existing agent config: hub=${HUB}"
-  fi
+[[ $EUID == 0 && -n "$HUB" && -n "$PIN" ]] || {
+  printf 'Usage (root): install-agent.sh --hub HOST:PORT --hub-pin PIN [--token TOKEN | --token-file FILE] [--version vX.Y.Z]\n' >&2; exit 1;
+}
+[[ "$HUB" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ && "$PIN" =~ ^sha256:[a-zA-Z0-9+/]+=*$ ]] || { printf 'Invalid hub or pin (use a DNS name or IPv4 address)\n' >&2; exit 1; }
+[[ "$SSHD" =~ ^127\.0\.0\.1:[0-9]+$ ]] || { printf 'Installer requires IPv4 loopback sshd\n' >&2; exit 1; }
+case "$(uname -m)" in x86_64) ARCH=amd64;; aarch64) ARCH=arm64;; *) exit 1;; esac
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+for DEP in python3 openssl systemctl; do command -v "$DEP" >/dev/null || { printf 'Required dependency: %s\n' "$DEP" >&2; exit 1; }; done
+VERIFIER=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then VERIFIER="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/verify-release.py"; fi
+if [[ ! -f "$VERIFIER" ]]; then
+  VERIFIER="$TMP/verify-release.py"
+  curl --proto '=https' --proto-redir '=https' -fsSL --max-time 60 -o "$VERIFIER" https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/verify-release.py
 fi
-
-# If still missing and interactive, prompt the user
-if [[ -z "$HUB" && -t 0 ]]; then
-  read -rp "Enter SSHub Hub address (e.g. hub.example.com:7000): " HUB
+[[ "$(sha256sum "$VERIFIER" | cut -d' ' -f1)" == 40de7c41da96e5ddfcc16f1e2f9a4927dcf3500a797776436053cda77a5f6774 ]] || { printf 'Verifier checksum mismatch\n' >&2; exit 1; }
+if [[ -z "$TOKEN_FILE" && -n "$TOKEN" ]]; then TOKEN_FILE="$TMP/token"; printf '%s\n' "$TOKEN" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"; fi
+[[ -f "$TOKEN_FILE" ]] || { printf 'A token or token file is required\n' >&2; exit 1; }
+if [[ -z "$RELEASE_DIR" ]]; then
+  RELEASE_DIR="$TMP/release"; mkdir -m 700 "$RELEASE_DIR"
+  TAG="$VERSION"; [[ "$TAG" == latest ]] && TAG="$(curl -fsSL https://api.github.com/repos/Trickhish/sshhub/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+  [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'Invalid release tag\n' >&2; exit 1; }
+  TAG="v${TAG#v}"; export SSHHUB_EXPECTED_VERSION="$TAG"
+  curl -fsSL -o "$RELEASE_DIR/sshhub-agent-linux-$ARCH.tar.gz" "https://github.com/Trickhish/sshhub/releases/download/$TAG/sshhub-agent-linux-$ARCH.tar.gz"
+  curl -fsSL -o "$RELEASE_DIR/sshhub-manifest.json" "https://github.com/Trickhish/sshhub/releases/download/$TAG/sshhub-manifest.json"
 fi
-
-if [[ -z "$TOKEN" && -t 0 ]]; then
-  read -rp "Enter Agent registration token: " TOKEN
-fi
-
-if [[ -z "$HUB_PIN" && -z "$INSECURE_NO_PIN" && -t 0 ]]; then
-  read -rp "Enter Hub key pin (run 'sshhub-ctl pin' on the hub): " HUB_PIN
-fi
-
-# If still missing, fail with a clear error
-if [[ -z "$HUB" ]]; then
-  echo "Error: Hub address is required. Specify with --hub <hub-host:7000>" >&2
-  exit 1
-fi
-
-if [[ -z "$TOKEN" ]]; then
-  echo "Error: Registration token is required. Specify with --token <token>" >&2
-  exit 1
-fi
-
-# The control connection carries the token, which is this agent's only
-# credential. Without a pin an on-path attacker can capture it, so refuse
-# rather than silently connecting unauthenticated.
-if [[ -z "$HUB_PIN" && -z "$INSECURE_NO_PIN" ]]; then
-  echo "Error: Hub key pin is required. Run 'sshhub-ctl pin' on the hub and pass --hub-pin <pin>." >&2
-  echo "       (Use --insecure-no-pin only for local testing; it exposes your token.)" >&2
-  exit 1
-fi
-
-echo "==> Installing / Updating SSHub Agent..."
-
-# 1. Check Root
-if [[ $EUID -ne 0 ]]; then
-  echo "Error: This script must be run as root (or with sudo)." >&2
-  exit 1
-fi
-
-# 2. Architecture detection
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64|amd64) GOARCH="amd64" ;;
-  aarch64|arm64) GOARCH="arm64" ;;
-  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
-esac
-
-# 3. Ensure dependencies
-if ! command -v curl >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq && apt-get install -y -qq curl tar
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q curl tar
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y -q curl tar
-  fi
-fi
-
-# 4. Stop service before binary replacement if currently running
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl daemon-reload || true
-  if systemctl is-active --quiet sshhub-agent; then
-    systemctl stop sshhub-agent || true
-  fi
-fi
-
-# 5. Install / Update binary
-TMP_DIR="$(mktemp -d)"
-cleanup() { rm -rf "$TMP_DIR"; }
-trap cleanup EXIT
-
-INSTALLED=false
-
-if [[ "$REBUILD" = false ]]; then
-  ASSET_NAME="sshhub-agent-linux-${GOARCH}.tar.gz"
-  API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-  if [[ "$VERSION" != "latest" ]]; then
-    TAG="$VERSION"
-    [[ ! "$TAG" =~ ^v ]] && TAG="v${TAG}"
-    API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
-  fi
-
-  echo "--> Fetching latest release binary from GitHub..."
-  DOWNLOAD_URL=""
-  if RELEASE_JSON="$(curl -fsSL -H "User-Agent: sshhub-installer" "$API_URL" 2>/dev/null)"; then
-    DOWNLOAD_URL="$(echo "$RELEASE_JSON" | grep -o "\"browser_download_url\":[[:space:]]*\"[^\"]*${ASSET_NAME}[^\"]*\"" | head -n 1 | cut -d'"' -f4 || true)"
-  fi
-
-  if [[ -z "$DOWNLOAD_URL" ]]; then
-    if [[ "$VERSION" == "latest" ]]; then
-      DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}"
-    else
-      DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET_NAME}"
-    fi
-  fi
-
-  if curl -fsSL -H "User-Agent: sshhub-installer" "$DOWNLOAD_URL" | tar -xz -C "$INSTALL_DIR" 2>/dev/null; then
-    echo "✓ Downloaded and installed release from GitHub!"
-    INSTALLED=true
-  fi
-fi
-
-if [[ "$INSTALLED" = false ]]; then
-  if ! command -v go >/dev/null 2>&1; then
-    echo "--> Installing Go compiler..."
-    GO_VERSION="1.23.6"
-    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" | tar -xz -C /usr/local
-    export PATH="/usr/local/go/bin:$PATH"
-  fi
-
-  echo "--> Compiling sshhub-agent from source..."
-  git clone --depth 1 "https://github.com/${REPO}.git" "${TMP_DIR}/src"
-  cd "${TMP_DIR}/src"
-  CGO_ENABLED=0 go build -ldflags="-s -w" -o "${INSTALL_DIR}/sshhub-agent" ./cmd/sshhub-agent
-  cd - >/dev/null
-fi
-
-chmod +x "${INSTALL_DIR}/sshhub-agent"
-
-# 6. Create or update Systemd Service
-EXEC_CMD="${INSTALL_DIR}/sshhub-agent --hub ${HUB} --token ${TOKEN}"
-if [[ -n "$HUB_PIN" ]]; then
-  EXEC_CMD="${EXEC_CMD} --hub-pin ${HUB_PIN}"
-fi
-if [[ -n "$INSECURE_NO_PIN" ]]; then
-  EXEC_CMD="${EXEC_CMD} --insecure-no-pin"
-fi
-if [[ -n "$SSHD" ]]; then
-  EXEC_CMD="${EXEC_CMD} --sshd ${SSHD}"
-fi
-
-if command -v systemctl >/dev/null 2>&1; then
-  echo "--> Configuring systemd service..."
-  cat > "$SERVICE_FILE" <<EOF
+python3 "$VERIFIER" "$RELEASE_DIR" "sshhub-agent-linux-$ARCH.tar.gz" "$TMP" sshhub-agent
+command -v sshd >/dev/null || { printf 'Install and configure OpenSSH server first\n' >&2; exit 1; }
+id sshhub-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin sshhub-agent
+install -d -m 700 /etc/sshhub-agent
+install -m 600 "$TOKEN_FILE" /etc/sshhub-agent/token.new
+mv /etc/sshhub-agent/token.new /etc/sshhub-agent/token
+install -m 755 "$TMP/sshhub-agent" /usr/local/bin/.sshhub-agent.new
+mv /usr/local/bin/.sshhub-agent.new /usr/local/bin/sshhub-agent
+cat > /etc/systemd/system/sshhub-agent.service <<EOF
 [Unit]
-Description=SSHub Reverse Agent
+Description=SSHub forwarding agent
 After=network.target
-
 [Service]
-Type=simple
-ExecStart=${EXEC_CMD}
+User=sshhub-agent
+Group=sshhub-agent
+LoadCredential=token:/etc/sshhub-agent/token
+ExecStart=/usr/local/bin/sshhub-agent --hub ${HUB} --hub-pin ${PIN} --token-file %d/token --sshd ${SSHD}
 Restart=always
-RestartSec=3
-LimitNOFILE=65536
-
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+TasksMax=128
+MemoryMax=256M
+LimitNOFILE=4096
 [Install]
 WantedBy=multi-user.target
 EOF
-
-  systemctl daemon-reload
-  systemctl enable --now sshhub-agent
-fi
-
-echo ""
-echo "✓ SSHub Agent installed/updated and connected to ${HUB}!"
-echo ""
+chmod 644 /etc/systemd/system/sshhub-agent.service
+systemctl daemon-reload
+systemctl enable sshhub-agent
+systemctl restart sshhub-agent
+printf 'Installed forwarding-only agent. Verify backend host keys independently on each SSH client.\n'

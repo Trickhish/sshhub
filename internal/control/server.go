@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	"github.com/Trickhish/sshhub/internal/hubupdate"
 	"github.com/Trickhish/sshhub/internal/version"
@@ -46,6 +47,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		<-ctx.Done()
 		ln.Close()
 	}()
+	slots := make(chan struct{}, 256)
 
 	for {
 		conn, err := ln.Accept()
@@ -57,13 +59,24 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 				return fmt.Errorf("accept: %w", err)
 			}
 		}
-		go s.handleConn(conn)
+		select {
+		case slots <- struct{}{}:
+			go func() {
+				defer func() { <-slots }()
+				stop := context.AfterFunc(ctx, func() { conn.Close() })
+				defer stop()
+				s.handleConn(conn)
+			}()
+		default:
+			conn.Close()
+		}
 	}
 }
 
 // handleConn wraps an agent connection in a yamux session and processes its
 // registration stream.
 func (s *Server) handleConn(conn net.Conn) {
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
 	session, err := yamux.Server(conn, yamux.DefaultConfig())
 	if err != nil {
 		conn.Close()
@@ -76,6 +89,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		session.Close()
 		return
 	}
+	conn.SetDeadline(time.Time{})
 
 	// A second agent presenting the same token must not silently displace or
 	// shadow the first: previously this error was discarded, so the hub logged
@@ -109,6 +123,10 @@ func (s *Server) register(session *yamux.Session) (backendID string, req Registe
 	if req.Token == "" {
 		WriteResponse(stream, RegisterResponse{OK: false, Error: "token is required"})
 		return "", req, &RegistrationError{Message: "token is required"}
+	}
+	if req.Transport != "openssh-forward-v1" {
+		WriteResponse(stream, RegisterResponse{OK: false, Error: "legacy embedded agents are not supported; migrate to OpenSSH forwarding"})
+		return "", req, fmt.Errorf("unsupported agent transport")
 	}
 
 	backendID, ok := s.resolveToken(req.Token, req.Backend)

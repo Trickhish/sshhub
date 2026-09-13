@@ -139,7 +139,7 @@ func main() {
 		pin := controlPlanePin(cfgPath)
 
 		fmt.Println()
-		fmt.Printf("✓ Backend %q successfully registered in %s\n", id, cfgPath)
+		fmt.Printf("✓ Backend %q registered in %s (transport only)\n", id, cfgPath)
 		fmt.Println()
 		fmt.Println("Generated Token:")
 		fmt.Printf("  %s\n", token)
@@ -147,16 +147,12 @@ func main() {
 		fmt.Println("Hub Key Pin:")
 		fmt.Printf("  %s\n", pin)
 		fmt.Println()
-		fmt.Printf("1-Line Agent Install Command (run on node %q):\n", id)
-		fmt.Printf("  curl -sSL %s | sudo bash -s -- --hub %s --token %q --hub-pin %q\n",
-			repoRawURL, hub, token, pin)
-		fmt.Println()
-		fmt.Printf("Manual binary command:\n")
-		fmt.Printf("  sshhub-agent --hub %s --token %q --hub-pin %q\n", hub, token, pin)
+		fmt.Println("Store the token in a root-only file on the node. Use the trusted")
+		fmt.Println("scripts/install-agent.sh with --release-dir, --token-file, --hub and --hub-pin.")
+		fmt.Println("Configure OpenSSH locally and add explicit jump_users grants on the hub.")
 		fmt.Println()
 		fmt.Println("To connect from your client:")
-		fmt.Printf("  ssh %s@%s\n", id, domain)
-		fmt.Printf("  ssh root@%s@%s\n", id, domain)
+		fmt.Printf("  ssh -J <jump-user>@%s <backend-user>@%s\n", domain, id)
 		fmt.Println()
 
 	case "remove", "rm":

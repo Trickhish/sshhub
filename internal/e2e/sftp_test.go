@@ -32,7 +32,7 @@ func remoteTestPath(t *testing.T) string {
 func TestSFTP_UploadAndDownloadRoundTrip(t *testing.T) {
 	h := newHarness(t)
 
-	client, err := h.dial(t, h.Backend, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
+	client, err := h.dialInner(t, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestSFTP_UploadAndDownloadRoundTrip(t *testing.T) {
 func TestSFTP_RunsAsEndUserNotRoot(t *testing.T) {
 	h := newHarness(t)
 
-	client, err := h.dial(t, h.Backend, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
+	client, err := h.dialInner(t, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestSFTP_RunsAsEndUserNotRoot(t *testing.T) {
 func TestSFTP_UnknownSubsystemRefused(t *testing.T) {
 	h := newHarness(t)
 
-	client, err := h.dial(t, h.Backend, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
+	client, err := h.dialInner(t, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

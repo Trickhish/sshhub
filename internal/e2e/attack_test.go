@@ -2,8 +2,7 @@ package e2e
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/Trickhish/sshhub/internal/control"
 	"github.com/Trickhish/sshhub/internal/hubtls"
-	"github.com/hashicorp/yamux"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -350,50 +348,32 @@ func TestAttack_ConnectionFloodDoesNotDenyService(t *testing.T) {
 // An attacker who reaches the agent's stream protocol directly must not be able
 // to forge an authorization header.
 func TestAttack_ForgedAgentSessionHeader(t *testing.T) {
-	agentSrv, err := control.NewAgentServer()
+	h := newHarness(t)
+	c, err := h.dial(t, h.Backend, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	defer c.Close()
+	raw, err := c.Dial("tcp", h.Backend+":22")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sshPub, _ := ssh.NewPublicKey(pub)
-
-	// Drive the agent through its real ServeStreams entrypoint, over a real
-	// yamux session, rather than reaching into unexported internals.
-	hubSide, agentSide := net.Pipe()
-	hubSession, err := yamux.Client(hubSide, yamux.DefaultConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hubSession.Close()
-	agentSession, err := yamux.Server(agentSide, yamux.DefaultConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer agentSession.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go agentSrv.ServeStreams(ctx, agentSession)
-
-	for _, req := range []control.SessionRequest{
-		{Purpose: control.PurposeSession, EndUser: "root", ClientKey: string(ssh.MarshalAuthorizedKey(sshPub))},
-		{Purpose: control.PurposeSession, EndUser: "root", ClientKey: ""},
-		{Purpose: control.PurposeSession, EndUser: "", ClientKey: "garbage"},
-		{Purpose: control.PurposeSession, EndUser: "nonexistent-user", ClientKey: "x"},
-	} {
-		stream, err := hubSession.OpenStream()
+	defer raw.Close()
+	raw.SetDeadline(time.Now().Add(5 * time.Second))
+	// Even a valid victim public key is merely data to OpenSSH, not an
+	// authenticated hub assertion. Exercise the actual formerly vulnerable pipe.
+	payload := []byte(fmt.Sprintf(`{"purpose":"session","end_user":%q,"client_key":%q}`, h.EndUser, string(ssh.MarshalAuthorizedKey(h.AuthorizedKey.PublicKey()))))
+	frame := append([]byte{'S', 'S', 'H', 'H', 1, 0, 0, byte(len(payload) >> 8), byte(len(payload))}, payload...)
+	raw.Write(frame)
+	buf := make([]byte, 4096)
+	for {
+		_, err = raw.Read(buf)
 		if err != nil {
-			t.Fatal(err)
+			break
 		}
-		err = control.RequestSession(stream, req)
-		stream.Close()
-		if err == nil {
-			t.Fatalf("SECURITY: agent accepted a forged header %+v", req)
-		}
+	}
+	if e, ok := err.(net.Error); ok && e.Timeout() {
+		t.Fatal("OpenSSH did not reject legacy identity frame")
 	}
 }
 

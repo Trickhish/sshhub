@@ -1,362 +1,148 @@
-<div align="center">
+# SSHub
 
-# 🌐 SSHub
+SSHub is a forwarding-only SSH gateway for machines behind NAT. Agents dial
+outbound TLS/Yamux tunnels to the hub and forward streams to a fixed loopback
+OpenSSH server. There is no embedded shell, SFTP server, or hub-asserted backend
+identity. Direct `ssh node@hub` sessions are refused.
 
-**A modern, zero-trust SSH gateway and reverse proxy platform.**  
-*Seamlessly connect to servers behind NATs, firewalls, and private networks with zero client configuration.*
-
-[![GitHub Release](https://img.shields.io/github/v/release/Trickhish/sshhub?color=blue&logo=github)](https://github.com/Trickhish/sshhub/releases)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/Trickhish/sshhub?logo=go)](https://golang.org)
-[![Platform](https://img.shields.io/badge/platform-linux%20%5Bamd64%20%7C%20arm64%5D-lightgrey?logo=linux)](https://github.com/Trickhish/sshhub/releases)
-[![Security](https://img.shields.io/badge/security-zero--trust%20%7C%20e2e-green?logo=ssh)](https://github.com/Trickhish/sshhub#security--zero-trust-model)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-</div>
-
----
-
-## 📑 Table of Contents
-
-- [Overview](#-overview)
-- [Architecture](#-architecture)
-- [Quick Start](#-quick-start)
-- [Key Features](#-key-features)
-- [Connecting to Nodes](#-connecting-to-nodes)
-- [CLI Management (`sshhub-ctl`)](#-cli-management-sshhub-ctl)
-- [Routing Rules & Cheatsheet](#-routing-rules--cheatsheet)
-- [Security & Zero-Trust Model](#-security--zero-trust-model)
-- [Configuration Reference](#-configuration-reference)
-- [Manual Compilation](#-manual-compilation)
-- [License](#-license)
-
----
-
-## 💡 Overview
-
-**SSHub** bridges private infrastructure and developers without requiring VPNs, complex port-forwarding, or backdoor credentials. 
-
-Nodes running `sshhub-agent` establish an **outbound reverse Yamux tunnel** to a central SSHub Gateway. You can access any node directly with standard OpenSSH commands (`ssh worker1@hub.example.com` or `ssh -J hub.example.com worker1`).
-
-### Two Flexible Modes:
-1. **Zero-Config Direct SSH (`ssh worker1@hub.example.com`)**:
-   - No `~/.ssh/config` modifications needed on client laptops.
-   - The Hub routes sessions to the node's native `sshhub-agent`.
-   - The agent authenticates the user directly against `/root/.ssh/authorized_keys`, spawns a native PTY, and launches the shell.
-2. **Layer-4 ProxyJump Passthrough (`ssh -J hub.example.com root@worker1`)**:
-   - Bridges raw TCP byte streams directly to an existing OpenSSH daemon (`sshd`).
-   - 100% end-to-end cryptographic encryption between your laptop and the backend.
-
----
-
-## 🏗️ Architecture
-
-```
-                          ┌────────────────────────────┐
-                          │        SSHub Gateway       │
-                          │      (Public VPS / Hub)    │
-   ssh worker1@hub ──────▶│                            │
-   ssh -J hub worker1 ───▶│  :22   SSH listener        │
-                          │  :7000 control listener    │
-                          └───────┬────────────┬───────┘
-                          direct  │            │ reverse
-                          dial    │            │ (agents dial outbound)
-                    ┌─────────────▼──┐      ┌──▼──────────────┐
-                    │ backend server │      │ backend server  │
-                    │  (reachable)   │      │  (behind NAT)   │
-                    └────────────────┘      └─────────────────┘
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Install the Gateway (on your public VPS / Hub)
-```sh
-curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-server.sh | sudo bash
-```
-
-### 2. Register a Node on the Hub
-Run `sshhub-ctl add` to generate a secure registration token and copy-paste installer:
-```sh
-sshhub-ctl add worker1
-```
-
-```text
-✓ Backend "worker1" successfully registered in /etc/sshhub/sshhub.yaml
-
-Generated Token:
-  AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k
-
-Hub Key Pin:
-  sha256:kTv3xQ2mB8pL5wR9cN4aY7jZ1fH6eU0oI2gX8vMdP4s=
-
-1-Line Agent Install Command (run on node "worker1"):
-  curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub hub.example.com:7000 --token "AUPF9eN5kEv-rzo68wNwmICAmqx6cLbyTMD9a5t0m8k" --hub-pin "sha256:kTv3xQ2mB8pL5wR9cN4aY7jZ1fH6eU0oI2gX8vMdP4s="
-```
-
-The **hub key pin** lets the agent verify it is talking to your Hub before it
-sends its token. It is required; retrieve it any time with `sshhub-ctl pin`.
-
-### 3. Install the Agent (on your private node behind NAT)
-Paste the generated command on your worker machine:
-```sh
-curl -sSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub hub.example.com:7000 --token "<token>" --hub-pin "<pin>"
-```
-
-### 4. Connect!
-```sh
-ssh worker1@hub.example.com
-```
-
----
-
-## ✨ Key Features
-
-- ⚡ **Instant Pre-Built Installs:** Install scripts fetch official GitHub Releases in <1s (no Go compiler required).
-- 🔄 **Fully Automated Updates:** Hub and agents automatically self-update over verified HTTPS whenever you push a new GitHub release tag.
-- 🛡️ **No Backend Credentials on the Hub:** The Hub holds no key or password that grants shell access to a node; every login is validated against the node's own `authorized_keys` by the agent.
-- 🔒 **Pinned, Encrypted Control Plane:** Agents reach the Hub over TLS and authenticate it by public key pin, so registration tokens cannot be intercepted.
-- 👤 **Least-Privilege Sessions:** Sessions drop to the Unix account named by the route's `end_user` (default `root`), which is set in config and never derived from client input.
-- 🖥️ **Embedded Native PTY:** Full terminal support including interactive shells, cursor positioning, and dynamic window resizing (`SIGWINCH`).
-- 🚪 **Zero Inbound Open Ports:** Nodes connect outbound to the Hub—ideal for home labs, private VPCs, and CGNAT environments.
-- 📦 **No OpenSSH Daemon Required:** Endpoints can run purely with the standalone `sshhub-agent` binary.
-- 🔀 **ProxyJump & ProxyCommand Compatible:** Works seamlessly with `ssh -J`, `ssh -W`, and existing Ansible/Terraform workflows.
-
----
-
-## 💻 Connecting to Nodes
-
-### 1. Direct SSH (Zero Client Configuration)
+## Connecting
 
 ```sh
-# Login directly as root:
-ssh worker1@hub.example.com
-
-# Target a specific remote user:
-ssh root@worker1@hub.example.com
-ssh dev@web1@hub.example.com
-
-# Run non-interactive remote commands:
-ssh worker1@hub.example.com "uptime && uname -a"
+ssh -J alice@hub.example.com deploy@worker1
+scp -o ProxyJump=alice@hub.example.com file worker1:/tmp/
+sftp -o ProxyJump=alice@hub.example.com deploy@worker1
 ```
 
-### 2. ProxyJump (`-J`)
-
-```sh
-ssh -J hub.example.com root@worker1
-```
-
-### 3. Using `~/.ssh/config` (Short Aliases)
-
-Add to your local `~/.ssh/config`:
+Or configure:
 
 ```sshconfig
+Host hub
+    HostName hub.example.com
+    User alice
+    IdentityFile ~/.ssh/jump_key
+    IdentitiesOnly yes
+    ForwardAgent no
+    StrictHostKeyChecking yes
+
 Host worker1
-  HostName hub.example.com
-  User worker1
+    HostName worker1
+    User deploy
+    ProxyJump hub
+    IdentityFile ~/.ssh/backend_key
+    IdentitiesOnly yes
+    ForwardAgent no
+    StrictHostKeyChecking yes
 ```
 
-Then simply connect with:
+Install the hub and backend public host keys into the client's known_hosts
+through an independent trusted channel before connecting. Never obtain the
+backend trust anchor solely from the hub you want to exclude from trust.
 
-```sh
-ssh worker1
-```
+The outer jump key grants transport access only. OpenSSH independently verifies
+the inner client's private-key possession and applies its own account, key,
+forced-command, PTY and SFTP policies. Do not authorize the hub's host key or any
+hub-held key on backends. Do not enable agent forwarding or host-based trust.
 
----
+## Hub configuration
 
-## 🛠️ CLI Management (`sshhub-ctl`)
-
-`sshhub-ctl` provides a command-line interface for managing backend routes and updates on the Hub.
-
-| Command | Description |
-| :--- | :--- |
-| `sshhub-ctl add <id>` | Generate a secure token, create route rules, and display the agent 1-liner |
-| `sshhub-ctl add <id> --end-user <user>` | As above, with sessions running as a specific Unix account |
-| `sshhub-ctl remove <id>` | Remove a backend node and its routing entries from the configuration |
-| `sshhub-ctl list` | Show backends with agent status, version, platform, and connection uptime |
-| `sshhub-ctl list --json` | Same, as JSON for scripting |
-| `sshhub-ctl pin` | Show the Hub key pin agents need for `--hub-pin` |
-| `sshhub-ctl update` | Check GitHub Releases and download/apply the latest Gateway update |
-| `sshhub-ctl update --check` | Check if a newer version is available without applying it |
-| `sshhub-ctl version` | Display current installed version |
-
----
-
-## 🧭 Routing Rules & Cheatsheet
-
-SSHub evaluates rules in `routes:` from **top to bottom** (first match wins):
-
-| Pattern | YAML Rule | Matching SSH Commands |
-| :--- | :--- | :--- |
-| **Exact User & Server** | `username: "alice"`<br>`hostname: "worker1"` | `ssh alice@worker1@hub` |
-| **Any User on Server** | `hostname: "worker1"` | `ssh root@worker1@hub`<br>`ssh alice@worker1@hub` |
-| **Direct Server Alias** | `username: "worker1"` | `ssh worker1@hub` |
-| **Wildcard Host Glob** | `hostname: "web*"` | `ssh root@web1@hub`<br>`ssh root@web-prod@hub` |
-| **Catch-All Default** | `username: "*"` | Any connection not matched above |
-
-**Which Unix account does the session run as?** Not the one in the SSH command.
-`username:`/`hostname:` are *routing identifiers* and need not be real accounts.
-The account is the matched route's `end_user:` (default `root`), so `ssh
-alice@worker1@hub` runs as whatever that route specifies — a client cannot pick
-a privileged account by choosing its login name. The client's key must still be
-in that account's `authorized_keys` on the node.
-
-```yaml
-routes:
-  # Route 1: Target specific user on specific host
-  - username: "backup"
-    hostname: "db1"
-    backend: db1
-
-  # Route 2: Single-word alias routing (ssh worker1@hub -> root on worker1)
-  - hostname: "worker1"
-    backend: worker1
-
-  # Route 3: Fallback default node
-  - username: "*"
-    backend: worker1
-```
-
----
-
-## 🛡️ Security & Zero-Trust Model
-
-SSHub is built with defense-in-depth:
-
-```
-                  ┌─────────────────────────────────────────┐
-                  │           Threat Model Defense          │
-                  └─────────────────────────────────────────┘
-   ┌───────────────────────────────────┐     ┌───────────────────────────────────┐
-   │         ProxyJump Mode            │     │       HTTPS GitHub Updates        │
-   │  • End-to-End Cryptography        │     │  • Zero Signing Keys on Hub       │
-   │  • Hub is a blind Layer 4 pipe    │     │  • Agents download from GitHub    │
-   │  • Hub cannot decrypt sessions    │     │  • Immune to Hub Compromise       │
-   └───────────────────────────────────┘     └───────────────────────────────────┘
-   ┌───────────────────────────────────┐     ┌───────────────────────────────────┐
-   │        Control Plane              │     │        Direct SSH Mode            │
-   │  • TLS with hub key pinning       │     │  • No backend creds on the Hub    │
-   │  • Agent host keys pinned         │     │  • Agent authorizes via own keys  │
-   │  • Tokens never sent in clear     │     │  • Hub DOES terminate the session │
-   └───────────────────────────────────┘     └───────────────────────────────────┘
-```
-
-1. **ProxyJump Mode (End-to-End Encryption)**:
-   - When using `ssh -J hub.example.com node`, key exchange and public key authentication occur **strictly between your client and the node**.
-   - In this mode the Hub is a byte pipe and cannot read the session.
-
-2. **Direct Mode (`ssh worker1@hub`) — what the Hub can and cannot do**:
-   - The Hub holds **no credential** that grants shell access to any node. Authorization is delegated to the agent, which checks the client's key against the target account's own `authorized_keys`.
-   - Sessions run as the route's `end_user` (default `root`), set in config and never derived from the client's login string.
-   - **However:** in this mode the Hub terminates the client's SSH connection, so a Hub compromised *while running* can observe traffic and open sessions to nodes that clients are authorized for. This is inherent to any username-routed jump host. Use ProxyJump mode where that matters.
-
-3. **Control Plane**:
-   - Agents connect over TLS and authenticate the Hub by **public key pin** (`--hub-pin`), so registration tokens cannot be captured on-path.
-   - The Hub pins each agent's SSH host key, and refuses to connect to a backend whose key it does not know.
-
-4. **Signed Releases**:
-   - Every release publishes a manifest listing each artifact's SHA-256 digest, signed with an **offline Ed25519 release key**. Hubs and agents verify the signature and the digest before installing, and refuse the update on any mismatch.
-   - Publishing a release is therefore *not* sufficient to ship code: the signing key is required as well, and it never exists on a hub, on an agent, or in a workflow that can publish releases.
-   - Updates are fetched from **GitHub Releases over TLS**. The Hub never distributes binaries, so a compromised Hub cannot inject code onto connected nodes.
-
-5. **Abuse Resistance**:
-   - Per-source-IP connection rate limiting, a concurrent-handshake cap, and temporary blocking after repeated authentication failures.
-   - The Hub does not accept password authentication in any form.
-
----
-
-## ⚙️ Configuration Reference
-
-The Gateway configuration is located at `/etc/sshhub/sshhub.yaml`:
+`/etc/sshhub/sshhub.yaml`, owned by root with mode 0600:
 
 ```yaml
 listen:
-  ssh: ":22"                 # Port where SSH clients connect
-  control: ":7000"           # Port where reverse agents connect
-
-public_host: "hub.example.com" # Public domain used in sshhub-ctl output
-
-host_key: "/etc/sshhub/ssh_host_ed25519_key"
-
-# How long a release must be public before the hub installs it automatically.
-#   48h      wait two days (default when omitted) -- a soak period, so a bad
-#            release has time to be noticed and replaced before it propagates
-#   0        install as soon as a release appears
-#   false    disable automatic updates entirely (update with 'sshhub-ctl update')
-# The newest release at the end of the wait is what installs, so an emergency
-# fix supersedes the release it fixes rather than queueing behind it.
-# auto_update_wait: 48h
-
-# TLS for the control plane. If omitted, a self-signed certificate is
-# generated at /etc/sshhub/control-cert.pem on first start and agents pin it.
-# tls_cert: "/etc/sshhub/control-cert.pem"
-# tls_key:  "/etc/sshhub/control-key.pem"
-
+  ssh: ':22'
+  control: ':7000'
+host_key: /etc/sshhub/ssh_host_ed25519_key
+auto_update_wait: false
 backends:
   - id: worker1
-    mode: reverse           # "reverse" is the only supported mode
-    token: "TNgPdS6pc0V7I0iSyP0Rclvy82txSuy7qm0FdtNKIcY="
-
-  - id: db1
     mode: reverse
-    token: "9dK2mVx7QpL4tR8sN1wZbC3fH6jY0aE5uI2oP7gX4vM="
-
-routes:
-  # end_user is the Unix account the session runs as on the node.
-  # It comes only from this config -- never from the client's login string --
-  # and defaults to root when omitted.
-  - hostname: "worker1"
-    backend: worker1
-    end_user: deploy        # ssh worker1@hub -> runs as deploy
-
-  - username: "admin"
-    hostname: "worker1"
-    backend: worker1        # ssh admin@worker1@hub -> runs as root (default)
-
-  - hostname: "db1"
-    backend: db1
-
-  - username: "*"
-    backend: worker1
+    token: '<random 32-byte token>'
+jump_users:
+  - name: alice
+    keys:
+      - 'ssh-ed25519 AAAA... alice-jump'
+    backends: [worker1]
 ```
 
-> **Note:** `mode: direct` was removed. The hub only routes to nodes running
-> `sshhub-agent`, which authenticates the client against the node's own
-> `authorized_keys`. A config still containing `direct`, or a `username:` field
-> on a backend, is rejected at startup with a migration message.
+Only exact backend IDs on logical destination port 22 are forwarded. The actual
+loopback address is configured locally on the agent, never chosen by the hub.
+An empty jump_users list grants nobody access. Keys with authorized_keys options
+are rejected rather than silently stripping their restrictions.
 
----
+## Installation and migration from 0.6.x
 
-## 🔧 Manual Compilation & Installer Options
+This is a breaking migration. Keep independent administrative access while
+upgrading both hub and agents. Old embedded-agent installations are incompatible.
 
-### 1-Line Installer Options
-
-| Option | Description |
-| :--- | :--- |
-| `--rebuild` (or `--build`) | Force compilation from Git source using Go instead of downloading pre-built releases |
-| `--version <vX.Y.Z>` | Install a specific release version (defaults to latest stable) |
-| `--hub <host:port>` | Hub control address (agent installer) |
-| `--token <token>` | Agent registration token (agent installer) |
-| `--ssh-port <port>` | Gateway SSH listener port (default: `:22`) |
-| `--control-port <port>` | Gateway Control plane port (default: `:7000`) |
-
-### Manual Build from Source
-
-Requires Go 1.22+:
+1. Install/configure OpenSSH on every backend. It must listen at the agent's
+   fixed loopback endpoint (default 127.0.0.1:22). Configure public-key-only auth,
+   account restrictions and forwarding policy there. Backend OpenSSH sees the
+   agent's loopback address, not the original client's IP; source-IP policies
+   must account for this.
+2. Independently provision host keys on clients. Keep backend private keys off
+   the hub. Remove any legacy hub host key from account authorized_keys after
+   verifying its identity and preserving your own access.
+3. Add jump_users with explicit keys and backend grants. Legacy routes/end_user
+   fields no longer define sessions; migrate and remove them.
+4. Download the release tarball for the host architecture and
+   sshhub-manifest.json into one directory. Use installer scripts from a trusted
+   checkout, not a script fetched dynamically from the hub.
+5. Put the registration token in a root-only file and run:
 
 ```sh
-# Clone repository:
-git clone https://github.com/Trickhish/sshhub.git
-cd sshhub
-
-# Build all binaries:
-go build -ldflags="-s -w" -o sshhub ./cmd/sshhub
-go build -ldflags="-s -w" -o sshhub-agent ./cmd/sshhub-agent
-go build -ldflags="-s -w" -o sshhub-ctl ./cmd/sshhub-ctl
+sudo scripts/install-agent.sh --release-dir /path/to/release \
+  --hub hub.example.com:7000 --hub-pin 'sha256:...' \
+  --token-file /root/worker1.token --sshd 127.0.0.1:22
+sudo scripts/install-server.sh --release-dir /path/to/release
 ```
 
----
+The scripts also support one-command installation, while still verifying the
+signed manifest and artifact digest before installation:
 
-## 📄 License
+```sh
+curl -fsSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-server.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub hub.example.com:7000 --hub-pin 'sha256:...' --token 'REGISTRATION_TOKEN'
+```
 
-Distributed under the **MIT License**. See [LICENSE](LICENSE) for more information.
+Installers require Python 3, OpenSSL with Ed25519 support, and modern systemd
+with LoadCredential support. They verify a pinned Ed25519 signature and artifact
+digest before extracting allowlisted files. No unverified download or automatic
+source-build fallback exists. Treat locally selected release directories as
+explicit operator version selection; select a current release, not an old one.
+
+The agent runs as an unprivileged system account with systemd sandboxing. Its
+token is delivered via LoadCredential, never an ExecStart argument. It cannot
+self-update or execute hub commands. Agent upgrades use the local installer.
+The hardened hub service also uses local installer upgrades by default;
+auto_update_wait is false because its sandbox denies executable replacement.
+
+## Trust and remaining operational responsibilities
+
+A compromised hub can interrupt or redirect traffic, learn timing/destination
+metadata, and send hostile bytes to OpenSSH. It cannot authenticate an inner
+session without backend credentials or defeat independently pinned host keys.
+This assumes patched endpoint software and no separate hub credentials trusted
+by the backend. This does not make parser vulnerabilities impossible.
+
+Rotate existing enrollment tokens after repairing legacy world-readable files
+or command-line exposure. Deleting the legacy installer does not undo past key
+authorizations or permissions on deployed hosts.
+
+Release builds now produce unsigned candidates only. Review the exact artifacts
+and sign them with sshhub-sign on an independently trusted signing machine;
+publish the artifacts and manifest only afterward. Remove the old repository
+SSHHUB_SIGNING_KEY secret and rotate it if exposure is suspected. The source
+change cannot revoke copies of a secret already stored in GitHub.
+
+## Development
+
+```sh
+go test ./... -race -count=1 -timeout 300s
+go vet ./...
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+```
+
+Integration tests require root, /usr/sbin/sshd, and /run/sshd. They create
+disposable accounts and isolated OpenSSH listeners. They exercise commands,
+PTYs and SFTP through the inner SSH connection and test identity/host-key
+isolation. No production service needs to be restarted for tests.

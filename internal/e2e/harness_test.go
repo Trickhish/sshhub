@@ -167,9 +167,10 @@ func newHarness(t *testing.T) *harness {
 	const token = "e2e-valid-token"
 
 	cfg := &config.Config{
-		Listen:   config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
-		HostKey:  hostKeyPath,
-		Backends: []config.Backend{{ID: backendID, Mode: "reverse", Token: token}},
+		JumpUsers: []config.JumpUser{{Name: backendID, Keys: []string{string(ssh.MarshalAuthorizedKey(clientSigner.PublicKey()))}, Backends: []string{backendID}}},
+		Listen:    config.Listen{SSH: "127.0.0.1:0", Control: "127.0.0.1:0"},
+		HostKey:   hostKeyPath,
+		Backends:  []config.Backend{{ID: backendID, Mode: "reverse", Token: token}},
 		Routes: []config.Route{
 			{Match: config.Match{Hostname: backendID}, Hostname: backendID, Backend: backendID, EndUser: endUser},
 		},
@@ -193,21 +194,17 @@ func newHarness(t *testing.T) *harness {
 	go controlSrv.ListenAndServe(ctx, controlAddr)
 	waitListening(t, controlAddr)
 
-	// Real agent with a persistent host key.
-	agentSrv, err := control.NewAgentServerWithHostKey(filepath.Join(dir, "agent_host_key"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	tlsCfg, err := hubtls.ClientConfig("127.0.0.1", pin)
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, assigned, err := control.ConnectWithHostKey(ctx, controlAddr, backendID, token, agentSrv.HostKey(), tlsCfg)
+	session, assigned, err := control.Connect(ctx, controlAddr, backendID, token, tlsCfg)
 	if err != nil {
 		t.Fatalf("agent could not register: %v", err)
 	}
 	t.Cleanup(func() { session.Close() })
-	go agentSrv.ServeStreams(ctx, session)
+	backendAddr, backendHostKey := startOpenSSH(t, dir, endUser)
+	go control.Serve(ctx, session, backendAddr)
 
 	if assigned != backendID {
 		t.Fatalf("agent assigned to %q, want %q", assigned, backendID)
@@ -230,7 +227,7 @@ func newHarness(t *testing.T) *harness {
 		Backend:       backendID,
 		EndUser:       endUser,
 		AuthorizedKey: clientSigner,
-		AgentHostKey:  agentSrv.HostKey(),
+		AgentHostKey:  backendHostKey,
 	}
 }
 
@@ -248,7 +245,10 @@ func (h *harness) dial(t *testing.T, login string, auth []ssh.AuthMethod) (*ssh.
 // run executes a command through the hub and returns its output.
 func (h *harness) run(t *testing.T, login string, auth []ssh.AuthMethod, cmd string) (string, error) {
 	t.Helper()
-	client, err := h.dial(t, login, auth)
+	if login != h.Backend {
+		return "", fmt.Errorf("unknown jump identity")
+	}
+	client, err := h.dialInner(t, auth)
 	if err != nil {
 		return "", err
 	}
@@ -262,4 +262,57 @@ func (h *harness) run(t *testing.T, login string, auth []ssh.AuthMethod, cmd str
 
 	out, err := sess.Output(cmd)
 	return string(out), err
+}
+
+func startOpenSSH(t *testing.T, dir, account string) (string, string) {
+	t.Helper()
+	signer, pemKey := generateKey(t)
+	keyPath := filepath.Join(dir, "backend_key")
+	if err := os.WriteFile(keyPath, []byte(pemKey), 0600); err != nil {
+		t.Fatal(err)
+	}
+	addr := freePort(t)
+	_, port, _ := net.SplitHostPort(addr)
+	path := filepath.Join(dir, "sshd_config")
+	text := fmt.Sprintf("ListenAddress 127.0.0.1\nPort %s\nHostKey %s\nPidFile %s\nAuthorizedKeysFile .ssh/authorized_keys\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nStrictModes yes\nMaxAuthTries 24\nSubsystem sftp internal-sftp\nSetEnv LANG=C.UTF-8 LC_CTYPE=C.UTF-8\n", port, keyPath, filepath.Join(dir, "sshd.pid"))
+	if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("usermod", "-p", "*", account).CombinedOutput(); err != nil {
+		t.Fatalf("test account: %v %s", err, out)
+	}
+	cmd := exec.Command("/usr/sbin/sshd", "-D", "-e", "-f", path)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	waitListening(t, addr)
+	return addr, string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+}
+
+func (h *harness) dialInner(t *testing.T, auth []ssh.AuthMethod) (*ssh.Client, error) {
+	outer, err := h.dial(t, h.Backend, []ssh.AuthMethod{ssh.PublicKeys(h.AuthorizedKey)})
+	if err != nil {
+		return nil, err
+	}
+	t.Cleanup(func() { outer.Close() })
+	raw, err := outer.Dial("tcp", h.Backend+":22")
+	if err != nil {
+		outer.Close()
+		return nil, err
+	}
+	key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(h.AgentHostKey))
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	raw.SetDeadline(time.Now().Add(10 * time.Second))
+	c, chans, reqs, err := ssh.NewClientConn(raw, h.Backend, &ssh.ClientConfig{User: h.EndUser, Auth: auth, HostKeyCallback: ssh.FixedHostKey(key)})
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	raw.SetDeadline(time.Time{})
+	return ssh.NewClient(c, chans, reqs), nil
 }

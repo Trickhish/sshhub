@@ -49,16 +49,8 @@ routes:
 	if b == nil || b.Token != token {
 		t.Fatalf("expected backend worker1 with token %s, got %+v", token, b)
 	}
-
-	// Check route was added before catch-all
-	if len(cfg.Routes) != 3 {
-		t.Fatalf("expected 3 routes, got %d: %+v", len(cfg.Routes), cfg.Routes)
-	}
-	if cfg.Routes[1].Match.Hostname != "worker1" || cfg.Routes[1].Backend != "worker1" {
-		t.Fatalf("unexpected route at index 1: %+v", cfg.Routes[1])
-	}
-	if cfg.Routes[2].Match.Username != "*" {
-		t.Fatalf("expected catch-all at the end, got %+v", cfg.Routes[2])
+	if len(cfg.Routes) != 2 {
+		t.Fatalf("legacy routes must be preserved, got %d", len(cfg.Routes))
 	}
 
 	// 2. Duplicate add should fail
@@ -79,6 +71,6 @@ routes:
 		t.Fatalf("expected only cidev backend left, got %+v", cfg.Backends)
 	}
 	if len(cfg.Routes) != 2 {
-		t.Fatalf("expected 2 routes left, got %d", len(cfg.Routes))
+		t.Fatalf("routes must not be silently modified, got %d", len(cfg.Routes))
 	}
 }
