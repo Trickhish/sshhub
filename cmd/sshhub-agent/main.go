@@ -30,9 +30,12 @@ func main() {
 	if *hub == "" || *tokenFile == "" {
 		log.Fatal("--hub and --token-file are required")
 	}
+	// World access is always refused. Group read is permitted so the token can be
+	// owned by root and read by the agent's dedicated group on systemd versions
+	// too old for LoadCredential; group-write is still refused.
 	st, err := os.Lstat(*tokenFile)
-	if err != nil || !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 {
-		log.Fatal("token file must be a regular owner-only file")
+	if err != nil || !st.Mode().IsRegular() || st.Mode().Perm()&0007 != 0 || st.Mode().Perm()&0020 != 0 {
+		log.Fatal("token file must be a regular file with no world access and no group write")
 	}
 	data, err := os.ReadFile(*tokenFile)
 	if err != nil {

@@ -48,6 +48,20 @@ install -m 600 "$TOKEN_FILE" /etc/sshhub-agent/token.new
 mv /etc/sshhub-agent/token.new /etc/sshhub-agent/token
 install -m 755 "$TMP/sshhub-agent" /usr/local/bin/.sshhub-agent.new
 mv /usr/local/bin/.sshhub-agent.new /usr/local/bin/sshhub-agent
+# systemd credentials (%d / LoadCredential) require v250+. On older systemd fall
+# back to a token file readable only by the agent's own group, so the token is
+# still never exposed on the command line or to other local users.
+SYSTEMD_VERSION="$(systemctl --version | awk 'NR==1{print $2}')"
+if [[ "$SYSTEMD_VERSION" =~ ^[0-9]+$ ]] && (( SYSTEMD_VERSION >= 250 )); then
+  CRED_LINE='LoadCredential=token:/etc/sshhub-agent/token'
+  TOKEN_ARG='%d/token'
+else
+  CRED_LINE=''
+  TOKEN_ARG='/etc/sshhub-agent/token'
+  chown root:sshhub-agent /etc/sshhub-agent /etc/sshhub-agent/token
+  chmod 750 /etc/sshhub-agent
+  chmod 640 /etc/sshhub-agent/token
+fi
 cat > /etc/systemd/system/sshhub-agent.service <<EOF
 [Unit]
 Description=SSHub forwarding agent
@@ -55,8 +69,8 @@ After=network.target
 [Service]
 User=sshhub-agent
 Group=sshhub-agent
-LoadCredential=token:/etc/sshhub-agent/token
-ExecStart=/usr/local/bin/sshhub-agent --hub ${HUB} --hub-pin ${PIN} --token-file %d/token --sshd ${SSHD}
+${CRED_LINE}
+ExecStart=/usr/local/bin/sshhub-agent --hub ${HUB} --hub-pin ${PIN} --token-file ${TOKEN_ARG} --sshd ${SSHD}
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes

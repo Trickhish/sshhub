@@ -82,4 +82,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REF: ${{ github.ref_name }}
         run: |
-          gh release create "$REF" release/* --verify-tag --latest=false --title "$REF: forwarding-only SSH" --notes "Breaking migration: OpenSSH backends and explicit jump_users grants are required. Direct SSH sessions and agent self-updates have been removed. Upgrade hub and agents together using independent administrative access. See the README migration instructions."
+          gh release create "$REF" release/* --verify-tag --latest --title "$REF: forwarding-only SSH" --notes "Breaking migration: OpenSSH backends and explicit jump_users grants are required. Direct SSH sessions and agent self-updates have been removed. Upgrade hub and agents together using independent administrative access. See the README migration instructions."

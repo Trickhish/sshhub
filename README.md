@@ -104,8 +104,10 @@ curl -fsSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/insta
 curl -fsSL https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh | sudo bash -s -- --hub hub.example.com:7000 --hub-pin 'sha256:...' --token 'REGISTRATION_TOKEN'
 ```
 
-Installers require Python 3, OpenSSL with Ed25519 support, and modern systemd
-with LoadCredential support. They verify a pinned Ed25519 signature and artifact
+Installers require Python 3, OpenSSL with Ed25519 support, and systemd. On
+systemd 250 or newer the token is passed via LoadCredential; on older systemd it
+is stored root-owned and group-readable by the agent account instead. In both
+cases the token never appears in the service command line. They verify a pinned Ed25519 signature and artifact
 digest before extracting allowlisted files. No unverified download or automatic
 source-build fallback exists. Treat locally selected release directories as
 explicit operator version selection; select a current release, not an old one.
