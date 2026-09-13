@@ -69,6 +69,14 @@ loopback address is configured locally on the agent, never chosen by the hub.
 An empty jump_users list grants nobody access. Keys with authorized_keys options
 are rejected rather than silently stripping their restrictions.
 
+A jump user with no `keys:` is OPEN: any client may open a tunnel as that user,
+and authentication is left entirely to each backend's own sshd. This avoids
+registering the same key both on the hub and on the endpoint, at the cost of
+exposing those sshd instances to anyone who can reach the hub. Harden the
+backend sshd (at minimum `PasswordAuthentication no`) before relying on it. The
+`backends:` restriction still applies, so an open user reaches only the backends
+it was granted, and other jump users keep their own key requirements.
+
 ## Installation and migration from 0.6.x
 
 This is a breaking migration. Keep independent administrative access while

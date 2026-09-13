@@ -221,8 +221,11 @@ func (c *Config) Validate() error {
 	}
 	seenUsers := map[string]bool{}
 	for _, u := range c.JumpUsers {
-		if u.Name == "" || seenUsers[u.Name] || len(u.Keys) == 0 || len(u.Backends) == 0 {
-			return fmt.Errorf("jump user needs a unique name, keys and backends")
+		// Keys MAY be empty: that makes the user open, delegating authentication
+		// entirely to each backend's own sshd. Backends are still required, so an
+		// open user cannot reach anything it was not explicitly granted.
+		if u.Name == "" || seenUsers[u.Name] || len(u.Backends) == 0 {
+			return fmt.Errorf("jump user needs a unique name and at least one backend")
 		}
 		seenUsers[u.Name] = true
 		for _, text := range u.Keys {

@@ -37,16 +37,53 @@ func New(cfg *config.Config, registry *control.Registry) (*Server, error) {
 	}
 	s := &Server{cfg: cfg, registry: registry, limiter: ratelimit.New(ratelimit.DefaultConfig())}
 	s.sshConfig = &ssh.ServerConfig{MaxAuthTries: 24, PublicKeyCallback: s.authorize}
+	// A jump user with no keys is deliberately open: the operator has chosen to
+	// rely solely on the backend's own authorized_keys. Such a user must still be
+	// able to complete the outer handshake when its client offers no key at all,
+	// otherwise "open" would only work for clients that happen to have one.
+	if s.hasOpenJumpUser() {
+		s.sshConfig.NoClientAuth = true
+	}
 	s.sshConfig.AddHostKey(key)
 	return s, nil
 }
 
+// hasOpenJumpUser reports whether any jump user is configured without keys.
+func (s *Server) hasOpenJumpUser() bool {
+	for _, u := range s.cfg.JumpUsers {
+		if len(u.Keys) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// isOpenJumpUser reports whether this specific user is configured without keys.
+func (s *Server) isOpenJumpUser(name string) bool {
+	for _, u := range s.cfg.JumpUsers {
+		if u.Name == name {
+			return len(u.Keys) == 0
+		}
+	}
+	return false
+}
+
 // Jump keys grant transport access only. Never consult backend authorized_keys
 // or send a client identity assertion through the tunnel.
+//
+// A jump user with an empty key list is OPEN: any client may open a tunnel as
+// that user. This is a supported configuration, not an oversight -- it makes the
+// hub a pure transport and leaves authentication entirely to the backend's own
+// sshd, at the cost of exposing that sshd to anyone who can reach the hub. The
+// destination restriction in forward() still applies, so an open user can still
+// only reach the backends it was granted.
 func (s *Server) authorize(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 	for _, access := range s.cfg.JumpUsers {
 		if access.Name != conn.User() {
 			continue
+		}
+		if len(access.Keys) == 0 {
+			return &ssh.Permissions{Extensions: map[string]string{"jump_user": access.Name}}, nil
 		}
 		for _, text := range access.Keys {
 			allowed, _, options, rest, err := ssh.ParseAuthorizedKey([]byte(text))
@@ -109,6 +146,15 @@ func (s *Server) handle(conn net.Conn, release func()) {
 		return
 	}
 	defer c.Close()
+	// NoClientAuth is set server-wide when ANY jump user is open, so a client can
+	// reach this point unauthenticated while naming a user that does require a
+	// key. Re-check here: without this, configuring one open user would silently
+	// remove the key requirement from every other user.
+	if c.Permissions == nil || c.Permissions.Extensions["jump_user"] == "" {
+		if !s.isOpenJumpUser(c.User()) {
+			return
+		}
+	}
 	conn.SetDeadline(time.Time{})
 	s.limiter.RecordSuccess(conn.RemoteAddr())
 	go ssh.DiscardRequests(reqs)
