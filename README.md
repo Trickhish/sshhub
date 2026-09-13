@@ -114,7 +114,22 @@ explicit operator version selection; select a current release, not an old one.
 
 The agent runs as an unprivileged system account with systemd sandboxing. Its
 token is delivered via LoadCredential, never an ExecStart argument. It cannot
-self-update or execute hub commands. Agent upgrades use the local installer.
+self-update or execute hub commands.
+
+Updates are handled by a SEPARATE root oneshot unit driven by
+sshhub-agent-update.timer, not by the agent process. This is privilege
+separation, not a thread: the network-facing process stays unprivileged, and the
+updater takes no input from the hub, the agent, or any network peer -- only the
+signed release manifest. Because it is an independent unit it keeps running when
+the agent is broken, so a bad agent release can still be superseded
+automatically instead of requiring a hand-install on every node.
+
+The updater resolves the version from GitHub directly and never from the hub, so
+a compromised hub cannot pin agents to an older vulnerable release. It verifies
+the signed manifest and artifact digest, refuses anything not strictly newer, and
+applies a soak period (default 24h) so a bad release has time to be replaced
+before it reaches the fleet. Disable with --no-auto-update, or tune with
+--update-soak.
 The hardened hub service also uses local installer upgrades by default;
 auto_update_wait is false because its sandbox denies executable replacement.
 

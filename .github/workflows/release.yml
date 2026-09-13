@@ -29,15 +29,23 @@ jobs:
           sudo env PATH="$PATH" go test ./... -race -count=1 -timeout 300s
           go vet ./...
       - name: Build candidates
+        env:
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
         run: |
+          test -n "$RELEASE_PUBLIC_KEY"
           mkdir -p release
           for ARCH in amd64 arm64; do
             mkdir -p "dist/$ARCH"
-            for BIN in sshhub sshhub-agent sshhub-ctl; do
-              CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath -ldflags="-s -w -X github.com/Trickhish/sshhub/internal/version.Version=$VERSION" -o "dist/$ARCH/$BIN" "./cmd/$BIN"
+            for BIN in sshhub sshhub-agent sshhub-agent-update sshhub-ctl; do
+              LDFLAGS="-s -w -X github.com/Trickhish/sshhub/internal/version.Version=$VERSION"
+              # The updater verifies signatures, so it must carry the trusted key
+              # and refuse anything it cannot verify.
+              LDFLAGS="$LDFLAGS -X github.com/Trickhish/sshhub/internal/release.TrustedPublicKey=${RELEASE_PUBLIC_KEY}"
+              LDFLAGS="$LDFLAGS -X github.com/Trickhish/sshhub/internal/release.RequireSignature=true"
+              CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath -ldflags="$LDFLAGS" -o "dist/$ARCH/$BIN" "./cmd/$BIN"
             done
             tar -czf "release/sshhub-linux-$ARCH.tar.gz" -C "dist/$ARCH" sshhub sshhub-ctl
-            tar -czf "release/sshhub-agent-linux-$ARCH.tar.gz" -C "dist/$ARCH" sshhub-agent
+            tar -czf "release/sshhub-agent-linux-$ARCH.tar.gz" -C "dist/$ARCH" sshhub-agent sshhub-agent-update
           done
       - uses: actions/upload-artifact@v4
         with:

@@ -2,7 +2,7 @@
 # Install a locally downloaded, signature-verified release. No curl|tar fallback.
 set -euo pipefail
 umask 077
-HUB=""; PIN=""; TOKEN_FILE=""; RELEASE_DIR=""; VERSION="latest"; TOKEN=""; SSHD="127.0.0.1:22"
+HUB=""; PIN=""; TOKEN_FILE=""; RELEASE_DIR=""; VERSION="latest"; TOKEN=""; SSHD="127.0.0.1:22"; SOAK="24h"
 while (($#)); do
   case "$1" in
     --hub) HUB="$2"; shift 2;;
@@ -12,6 +12,8 @@ while (($#)); do
     --version) VERSION="$2"; shift 2;;
     --token) TOKEN="$2"; shift 2;;
     --sshd) SSHD="$2"; shift 2;;
+    --update-soak) SOAK="$2"; shift 2;;
+    --no-auto-update) SOAK="off"; shift;;
     *) printf 'Unknown argument: %s\n' "$1" >&2; exit 1;;
   esac
 done
@@ -40,7 +42,7 @@ if [[ -z "$RELEASE_DIR" ]]; then
   curl -fsSL -o "$RELEASE_DIR/sshhub-agent-linux-$ARCH.tar.gz" "https://github.com/Trickhish/sshhub/releases/download/$TAG/sshhub-agent-linux-$ARCH.tar.gz"
   curl -fsSL -o "$RELEASE_DIR/sshhub-manifest.json" "https://github.com/Trickhish/sshhub/releases/download/$TAG/sshhub-manifest.json"
 fi
-python3 "$VERIFIER" "$RELEASE_DIR" "sshhub-agent-linux-$ARCH.tar.gz" "$TMP" sshhub-agent
+python3 "$VERIFIER" "$RELEASE_DIR" "sshhub-agent-linux-$ARCH.tar.gz" "$TMP" sshhub-agent sshhub-agent-update
 command -v sshd >/dev/null || { printf 'Install and configure OpenSSH server first\n' >&2; exit 1; }
 id sshhub-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin sshhub-agent
 install -d -m 700 /etc/sshhub-agent
@@ -92,7 +94,64 @@ LimitNOFILE=4096
 WantedBy=multi-user.target
 EOF
 chmod 644 /etc/systemd/system/sshhub-agent.service
+
+# Privileged updater, deliberately a SEPARATE unit rather than a thread or a
+# capability of the agent. The agent keeps no way to trigger it, and it keeps
+# running when the agent is broken -- so a bad agent release can still be
+# superseded automatically instead of needing a hand-install on every node.
+install -m 755 "$TMP/sshhub-agent-update" /usr/local/bin/.sshhub-agent-update.new
+mv /usr/local/bin/.sshhub-agent-update.new /usr/local/bin/sshhub-agent-update
+install -d -m 755 /usr/local/lib/sshhub
+install -m 755 "${BASH_SOURCE[0]:-$VERIFIER}" /usr/local/lib/sshhub/install-agent.sh 2>/dev/null || \
+  curl --proto '=https' -fsSL --max-time 60 -o /usr/local/lib/sshhub/install-agent.sh \
+    https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh
+chmod 755 /usr/local/lib/sshhub/install-agent.sh
+install -m 755 "$VERIFIER" /usr/local/lib/sshhub/verify-release.py
+
+if [[ "$SOAK" == off ]]; then
+  systemctl disable --now sshhub-agent-update.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/sshhub-agent-update.timer /etc/systemd/system/sshhub-agent-update.service
+else
+  cat > /etc/systemd/system/sshhub-agent-update.service <<EOF
+[Unit]
+Description=SSHub agent verified update
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sshhub-agent-update --soak ${SOAK} --installer /usr/local/lib/sshhub/install-agent.sh
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+TasksMax=64
+TimeoutStartSec=600
+EOF
+  chmod 644 /etc/systemd/system/sshhub-agent-update.service
+  cat > /etc/systemd/system/sshhub-agent-update.timer <<'EOF'
+[Unit]
+Description=SSHub agent verified update check
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=30min
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 /etc/systemd/system/sshhub-agent-update.timer
+fi
+
 systemctl daemon-reload
 systemctl enable sshhub-agent
 systemctl restart sshhub-agent
+[[ "$SOAK" == off ]] || systemctl enable --now sshhub-agent-update.timer
 printf 'Installed forwarding-only agent. Verify backend host keys independently on each SSH client.\n'
+if [[ "$SOAK" == off ]]; then
+  printf 'Automatic updates are DISABLED. Re-run this installer to upgrade.\n'
+else
+  printf 'Verified auto-update enabled (soak %s) via sshhub-agent-update.timer.\n' "$SOAK"
+fi
