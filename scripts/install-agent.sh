@@ -108,7 +108,11 @@ install -d -m 755 /usr/local/lib/sshhub
 # it here silently breaks every future automatic update.
 INSTALLER_DST=/usr/local/lib/sshhub/install-agent.sh
 if [[ -n "${BASH_SOURCE[0]:-}" && -r "${BASH_SOURCE[0]}" ]] && head -1 "${BASH_SOURCE[0]}" | grep -q bash; then
-  install -m 755 "${BASH_SOURCE[0]}" "$INSTALLER_DST"
+  # Already running FROM the persisted path (the updater re-runs it): nothing to
+  # copy, and `install` would fail on same-file.
+  if [[ "$(realpath "${BASH_SOURCE[0]}")" != "$(realpath -m "$INSTALLER_DST")" ]]; then
+    install -m 755 "${BASH_SOURCE[0]}" "$INSTALLER_DST"
+  fi
 else
   curl --proto '=https' --proto-redir '=https' -fsSL --max-time 60 -o "$INSTALLER_DST.new" \
     https://raw.githubusercontent.com/Trickhish/sshhub/main/scripts/install-agent.sh
