@@ -83,7 +83,7 @@ jobs:
           mkdir verified
           for ARCH in amd64 arm64; do
             python3 scripts/verify-release.py release "sshhub-linux-$ARCH.tar.gz" verified sshhub sshhub-ctl
-            python3 scripts/verify-release.py release "sshhub-agent-linux-$ARCH.tar.gz" verified sshhub-agent
+            python3 scripts/verify-release.py release "sshhub-agent-linux-$ARCH.tar.gz" verified sshhub-agent sshhub-agent-update
           done
       - name: Publish breaking release without changing latest
         env:
